@@ -32,11 +32,6 @@ TRENDING_MIN_MCAP_USD = 2_000
 
 # Spectral: second bot that DMs its users the trending tokens matching their filters.
 SPECTRAL_DEFAULT_MIN_MINUTES = 10
-SPECTRAL_TIME_OPTIONS = (5, 10, 15, 30, 60)
-SPECTRAL_MIN_MULT_OPTIONS = (None, 0.5, 0.7, 1, 1.5)  # None = no lower bound
-SPECTRAL_MAX_MULT_OPTIONS = (1.5, 2, 3, 5, None)      # None = no upper bound
-SPECTRAL_MIN_MCAP_OPTIONS = (None, 10_000, 20_000, 50_000, 100_000)  # USD
-SPECTRAL_MAX_MCAP_OPTIONS = (50_000, 100_000, 250_000, 500_000, None)  # USD
 SPECTRAL_CHECK_SECONDS = 5
 # Bot API allows ~30 messages/s across all chats.
 SPECTRAL_SEND_INTERVAL_SECONDS = 0.05

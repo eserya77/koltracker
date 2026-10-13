@@ -103,11 +103,13 @@ CREATE TABLE IF NOT EXISTS spectral_users (
     created_ts INTEGER NOT NULL
 );
 
--- Tokens already sent to each Spectral user; their events follow.
+-- Tokens each Spectral user has seen. sent = 1: delivered, its events follow.
+-- sent = 0: already matching when the user started or changed filters, skipped.
 CREATE TABLE IF NOT EXISTS spectral_deliveries (
     chat_id INTEGER NOT NULL REFERENCES spectral_users(chat_id),
     mint TEXT NOT NULL,
     ts INTEGER NOT NULL,
+    sent INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (chat_id, mint)
 );
 CREATE INDEX IF NOT EXISTS spectral_deliveries_mint ON spectral_deliveries(mint);
@@ -142,13 +144,14 @@ class Store:
 
     def _migrate(self):
         """Add columns introduced after a database was created."""
-        added = {'trending': ('entry_mcap_sol', 'last_mcap_sol'),
-                 'spectral_users': ('min_mcap', 'max_mcap')}
+        added = {'trending': {'entry_mcap_sol': 'REAL', 'last_mcap_sol': 'REAL'},
+                 'spectral_users': {'min_mcap': 'REAL', 'max_mcap': 'REAL'},
+                 'spectral_deliveries': {'sent': 'INTEGER NOT NULL DEFAULT 1'}}
         for table, new_columns in added.items():
             columns = {r['name'] for r in self.conn.execute(f'PRAGMA table_info({table})')}
-            for column in new_columns:
+            for column, type_ in new_columns.items():
                 if column not in columns:
-                    self.conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} REAL')
+                    self.conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {type_}')
 
     def close(self):
         self.conn.close()
@@ -318,11 +321,12 @@ class Store:
     def spectral_deactivate(self, chat_id):
         self.conn.execute('UPDATE spectral_users SET active = 0 WHERE chat_id = ?', (chat_id,))
 
-    def spectral_record_delivery(self, chat_id, mint, ts):
-        cur = self.conn.execute(
-            'INSERT OR IGNORE INTO spectral_deliveries(chat_id, mint, ts) VALUES (?, ?, ?)',
-            (chat_id, mint, ts))
-        return cur.rowcount == 1
+    def spectral_record_delivery(self, chat_id, mint, ts, sent=True):
+        """A skipped token can later become sent (via /show); never the other way."""
+        self.conn.execute(
+            'INSERT INTO spectral_deliveries(chat_id, mint, ts, sent) VALUES (?, ?, ?, ?) '
+            'ON CONFLICT(chat_id, mint) DO UPDATE SET sent = MAX(sent, excluded.sent)',
+            (chat_id, mint, ts, int(sent)))
 
     def spectral_deliveries(self):
-        return self.conn.execute('SELECT chat_id, mint FROM spectral_deliveries').fetchall()
+        return self.conn.execute('SELECT chat_id, mint, sent FROM spectral_deliveries').fetchall()

@@ -149,7 +149,9 @@ class Tracker:
         kol = self.kols[wallet.kol_id]
         kol_rows = self.store.kol_positions(kol.id, mint)
         text = fmt.buy(kol, wallet, trade, meta, kol_rows, self.sol_usd, paid, trade['ts'])
-        self.publish(TOPIC_MAINS if wallet.role == 'main' else TOPIC_SIDES, text, mint)
+        self.publish(TOPIC_MAINS if wallet.role == 'main' else TOPIC_SIDES, text, mint, forward=False)
+        if self.spectral:
+            self.spectral.on_kol_buy(kol, wallet, trade, meta, paid)
 
     async def token_meta(self, mint):
         meta = self._meta.get(mint)
@@ -287,10 +289,10 @@ class Tracker:
             await asyncio.sleep(interval)
 
     # --- helpers ------------------------------------------------------------
-    def publish(self, topic, text, mint):
-        """Posts to the KOL group; Spectral followers get everything except trending alerts."""
+    def publish(self, topic, text, mint, forward=True):
+        """Posts to the KOL group and forwards events to Spectral (never trending alerts)."""
         self.out.post(topic, text, mint)
-        if self.spectral and topic != TOPIC_TRENDING:
+        if self.spectral and forward and topic != TOPIC_TRENDING:
             self.spectral.forward(mint, text)
 
     def kol_names(self, mint):

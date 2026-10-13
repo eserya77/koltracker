@@ -1,9 +1,9 @@
 """Telegram HTML message builders.
 
-Buy and trending messages open with the token header, the KOL line and the CA;
-event messages open with the event name. Sections are separated by a blank
-line. KOL wallets are never shown or linked, and KOL amounts are salted
-(see salt.py).
+Buy and trending messages open with the token header, the KOL line and the CA.
+Event and Spectral messages open with a title plus a one-line explanation of
+what happened. Sections are separated by a blank line. KOL wallets are never
+shown or linked, and KOL amounts are salted (see salt.py).
 """
 
 from html import escape
@@ -24,16 +24,24 @@ VENUES = {
     'orca-whirlpool': 'Orca',
 }
 
-# Event type -> (emoji, name shown on the first line).
+# Event type -> (emoji, title, explanation template). Templates may use
+# {kol}, {wallet} and {venue}; values are HTML-escaped before formatting.
 EVENTS = {
-    'migrate': ('🎓', 'Migration'),
-    'create': ('🧪', 'Token created'),
-    'add': ('💧', 'Liquidity added'),
-    'remove': ('🏜', 'Liquidity removed'),
-    'dex_paid': ('🦅', 'DEX paid'),
-    'cto': ('🏴‍☠️', 'Community takeover'),
-    'boost': ('⚡', 'DEX boost'),
-    'ad': ('📣', 'DEX ad'),
+    'migrate': ('🎓', 'Migrated',
+                'The bonding curve is complete. The token now trades on {venue}.'),
+    'create': ('🧪', 'New launch by a KOL', '{kol} created this token from {wallet}.'),
+    'add': ('💧', 'Liquidity added', "{kol} deposited liquidity into this token's {venue} pool."),
+    'remove': ('🚱', 'Liquidity removed', "{kol} withdrew liquidity from this token's {venue} pool."),
+    'dex_paid': ('🦅', 'DEX paid',
+                 "Someone paid for this token's DexScreener profile (logo, socials, banner). "
+                 'Usually the dev or the community investing in it.'),
+    'cto': ('🏴‍☠️', 'Community takeover',
+            "The original dev left and the community now runs the token's DexScreener page."),
+    'boost': ('⚡', 'DexScreener boost', "Someone paid to push this token up DexScreener's trending list."),
+    'ad': ('📣', 'DexScreener ad', 'A paid ad for this token is running on DexScreener.'),
+    'match': ('🎯', 'New match', '2+ KOLs are in this token and it fits your filters.'),
+    'buy_entered': ('{icon}', 'KOL buy · {side}', '{kol} just entered a token you received.'),
+    'buy_added': ('{icon}', 'KOL buy · {side}', '{kol} bought more of a token you received.'),
 }
 
 
@@ -103,6 +111,17 @@ def holding_status(bought, held):
     return f'🟡 Holding {ratio:.0%}'
 
 
+def short_status(bought, held):
+    if bought <= 0:
+        return '—'
+    ratio = held / bought
+    if ratio >= 0.98:
+        return '🟢 holding'
+    if ratio <= 0.02:
+        return '🔴 sold'
+    return f'🟡 {ratio:.0%} left'
+
+
 def avg_entry(rows):
     """SOL-weighted average entry market cap over one or more positions."""
     priced = sum(r['sol_in_priced'] for r in rows)
@@ -113,6 +132,18 @@ def avg_entry(rows):
 
 def position_sol(position):
     return salted(position['sol_in'], position['wallet'], position['mint'])
+
+
+def kols_in_token(rows, kols):
+    """Per-KOL totals for a token: [(kol_id, name, salted SOL, bought, held)], biggest first."""
+    totals = {}
+    for row in rows:
+        entry = totals.setdefault(row['kol_id'], [0.0, 0.0, 0.0])
+        entry[0] += position_sol(row)
+        entry[1] += row['bought_tokens']
+        entry[2] += held_tokens(row)
+    return sorted(((kol_id, kols[kol_id].name, sol, bought, held)
+                   for kol_id, (sol, bought, held) in totals.items()), key=lambda e: -e[2])
 
 
 # --- building blocks -----------------------------------------------------------
@@ -140,13 +171,29 @@ def wallet_role(kol, wallet):
     return f'{kol.name} · Side wallet ({wallet.label})'
 
 
+def wallet_kind(wallet):
+    return 'their main wallet' if wallet.role == 'main' else 'a side wallet'
+
+
 def header(icon, meta, kol_text):
     return section(f'{icon} {token_line(meta)}', kol_line(kol_text))
 
 
-def event_header(type_, meta, kol_text):
-    icon, name = EVENTS[type_]
-    return message(f'{icon} <b>{name}</b>', section(token_line(meta), kol_line(kol_text)))
+def event_title(type_, **values):
+    icon, title, explanation = EVENTS[type_]
+    safe = {k: escape(str(v)) for k, v in values.items()}
+    return section(f'{icon.format(**safe)} <b>{title.format(**safe)}</b>',
+                   f'<i>{explanation.format(**safe)}</i>')
+
+
+def token_block(mint, meta):
+    return section(token_line(meta), ca(mint))
+
+
+def kols_in_line(names):
+    if not names:
+        return None
+    return f'👥 KOLs in: {escape(", ".join(names))}'
 
 
 def ca(mint):
@@ -195,7 +242,22 @@ def side_breakdown(rows, sol_usd):
     return '<blockquote expandable><b>🔍 Side wallet breakdown</b>\n\n' + '\n\n'.join(entries) + '</blockquote>'
 
 
-# --- messages ------------------------------------------------------------------
+def kols_block(entries, highlight=None, limit=10):
+    """'Who is in' list: KOLs still holding first, then those who sold."""
+    if not entries:
+        return None
+    ordered = sorted(entries, key=lambda e: (e[4] <= 0.02 * e[3], -e[2]))
+    lines = []
+    for kol_id, name, sol, bought, held in ordered[:limit]:
+        label = f'<b>{escape(name)}</b>' if kol_id == highlight else escape(name)
+        lines.append(f'{label} · {fmt_sol(sol)} · {short_status(bought, held)}')
+    if len(ordered) > limit:
+        lines.append(f'+{len(ordered) - limit} more')
+    inside = sum(1 for e in entries if e[4] > 0.02 * e[3])
+    return section(f'👥 <b>KOLs in this token</b> · {inside} holding, {len(entries) - inside} out', *lines)
+
+
+# --- KOL group messages --------------------------------------------------------
 def buy(kol, wallet, trade, meta, kol_rows, sol_usd, paid, now):
     """Same layout for main and side buys; only the icon and buyer line differ."""
     mains = [r for r in kol_rows if r['role'] == 'main']
@@ -223,43 +285,45 @@ def trending_step(mint, meta, state, update, kol_names, sol_usd, now):
     )
 
 
+# --- events (KOL group Events topic and Spectral) -------------------------------
 def migration(mint, meta, event, mcap_sol, sol_usd, holders):
     burned = event.get('burnedLiquidity')
     return message(
-        event_header('migrate', meta, ', '.join(holders)),
-        ca(mint),
-        section(f'🏦 New pool: {venue_name(event.get("pool"))}',
-                f'📊 MC: {fmt_mcap(mcap_sol, sol_usd)}',
-                f'🔥 Burned liquidity: {escape(str(burned))}' if burned is not None else None),
+        event_title('migrate', venue=venue_name(event.get('pool'))),
+        token_block(mint, meta),
+        section(f'📊 MC: {fmt_mcap(mcap_sol, sol_usd)}',
+                f'🔥 Liquidity burned: {escape(str(burned))}' if burned is not None else None),
+        kols_in_line(holders),
     )
 
 
 def kol_create(kol, wallet, mint, meta, event, sol_usd, mcap_sol):
     return message(
-        event_header('create', meta, wallet_role(kol, wallet)),
-        ca(mint),
-        section(f'🏦 Venue: {venue_name(event.get("pool"))}',
+        event_title('create', kol=kol.name, wallet=wallet_kind(wallet)),
+        token_block(mint, meta),
+        section(f'🏦 Launchpad: {venue_name(event.get("pool"))}',
                 f'📊 MC: {fmt_mcap(mcap_sol, sol_usd)}'),
+        kol_line(wallet_role(kol, wallet)),
     )
 
 
 def liquidity(kol, wallet, mint, meta, action, sol, tokens, event):
     return message(
-        event_header(action, meta, wallet_role(kol, wallet)),
-        ca(mint),
+        event_title(action, kol=kol.name, venue=venue_name(event.get('pool'))),
+        token_block(mint, meta),
         section(f'💰 Amount: {fmt_sol(salted(sol, wallet.address, mint))} + '
-                f'{fmt_num(salted(tokens or 0, wallet.address, mint))} tokens',
-                f'🏦 Venue: {venue_name(event.get("pool"))}'),
+                f'{fmt_num(salted(tokens or 0, wallet.address, mint))} tokens'),
+        kol_line(wallet_role(kol, wallet)),
     )
 
 
 def dex_event(type_, mint, meta, item, holders):
     details = None
     if type_ == 'boost':
-        details = f'⚡ Boost: +{item.get("amount", "?")} (total {item.get("totalAmount", "?")})'
+        details = f'⚡ +{item.get("amount", "?")} boosts · {item.get("totalAmount", "?")} active'
     elif type_ == 'ad':
-        details = f'📣 Ad: {escape(str(item.get("type") or "ad"))} · {item.get("durationHours", "?")}h'
-    return message(event_header(type_, meta, ', '.join(holders)), ca(mint), details)
+        details = f'📣 {escape(str(item.get("type") or "ad"))} · {item.get("durationHours", "?")}h'
+    return message(event_title(type_), token_block(mint, meta), details, kols_in_line(holders))
 
 
 # --- Spectral ------------------------------------------------------------------
@@ -283,52 +347,87 @@ def fmt_usd_range(low, high):
     return f'${fmt_num(low)} – ${fmt_num(high)}'
 
 
-def spectral_token(mint, meta, state, kol_names, sol_usd, paid, now):
+def market_line(state, sol_usd):
+    return f'📊 MC: <b>{fmt_mcap(state.mcap, sol_usd)}</b> · {state.mcap / state.entry:.2f}x since tracked'
+
+
+def spectral_match(mint, meta, state, kols, sol_usd, paid, now):
     return message(
-        header('🔮', meta, ', '.join(kol_names)),
-        ca(mint),
-        section(f'⏱ In trending: {fmt_duration(now - state.entered_ts)}',
-                f'📈 Multiplier: <b>{state.mcap / state.entry:.2f}x</b> since tracked',
-                f'📊 MC: {fmt_mcap(state.mcap, sol_usd)}',
-                f'🎯 Tracked at: {fmt_mcap(state.entry, sol_usd)}',
-                f'🏔 ATH: {fmt_mcap(state.ath, sol_usd)}'),
+        event_title('match'),
+        token_block(mint, meta),
+        section(market_line(state, sol_usd),
+                f'🏁 Tracked at: {fmt_mcap(state.entry, sol_usd)} · 🏔 ATH: {fmt_mcap(state.ath, sol_usd)}',
+                f'⏱ In trending: {fmt_duration(now - state.entered_ts)}'),
+        kols_block(kols),
         dex_paid_line(paid),
     )
 
 
-def spectral_list(items, total, sol_usd, now):
-    """items: [(meta, state)] already sorted; total counts every match."""
-    if not items:
-        return message('🔮 <b>Matching tokens</b>', 'No trending token matches your filters right now.')
-    entries = [section(f'{i}. {token_line(meta)}',
-                       f'📈 {state.mcap / state.entry:.2f}x · 📊 {fmt_mcap(state.mcap, sol_usd)} · '
-                       f'⏱ {fmt_duration(now - state.entered_ts)}',
-                       ca(state.mint))
-               for i, (meta, state) in enumerate(items, 1)]
-    more = f'+{total - len(items)} more' if total > len(items) else None
-    return message(f'🔮 <b>Matching tokens</b> ({total})', *entries, more)
-
-
-def spectral_settings(user):
+def spectral_buy(kol, wallet, trade, meta, state, kols, sol_usd, paid, first_buy):
+    sol = salted(trade['sol'], trade['wallet'], trade['mint'])
     return message(
-        '⚙️ <b>Settings</b>',
-        section(f'⏱ Min time in trending: <b>{user["min_minutes"]}m</b>',
-                f'📈 Multiplier range: <b>{fmt_range(user["min_mult"], user["max_mult"])}</b>',
-                f'💰 Market cap: <b>{fmt_usd_range(user["min_mcap"], user["max_mcap"])}</b>'),
-        'You get a token once it has been in trending at least this long, its multiplier '
-        'since tracking started is inside the range and its market cap is inside yours.',
-        section('Custom values:',
-                '<code>/time 12</code>',
-                '<code>/range 0.7 2</code> · <code>/range 1 any</code> · <code>/range any</code>',
-                '<code>/mcap 20k 100k</code> · <code>/mcap any 100k</code> · '
-                '<code>/mcap 20k any</code> · <code>/mcap any</code>'),
+        event_title('buy_entered' if first_buy else 'buy_added', kol=kol.name,
+                    icon='🟢' if wallet.role == 'main' else '🔵',
+                    side='main wallet' if wallet.role == 'main' else 'side wallet'),
+        token_block(trade['mint'], meta),
+        section(f'🛒 Bought: <b>{fmt_sol(sol)}</b> at {fmt_mcap(trade["mcap_sol"], sol_usd)} MC',
+                f'🏦 Venue: {venue_name(trade["venue"])}'),
+        kols_block(kols, highlight=kol.id),
+        section(market_line(state, sol_usd), dex_paid_line(paid)),
+    )
+
+
+def spectral_list(items, total, sol_usd, now):
+    """items: [(meta, state, kol_count)] already sorted; total counts every match."""
+    if not items:
+        return message('📋 <b>Your matches</b>',
+                       '<i>No trending token fits your filters right now. '
+                       'New matches will arrive here automatically.</i>')
+    entries = [section(f'{i}. {token_line(meta)}',
+                       f'📊 {fmt_mcap(state.mcap, sol_usd)} · {state.mcap / state.entry:.2f}x · '
+                       f'⏱ {fmt_duration(now - state.entered_ts)} · 👥 {kol_count} KOLs',
+                       ca(state.mint))
+               for i, (meta, state, kol_count) in enumerate(items, 1)]
+    more = f'<i>+{total - len(items)} more</i>' if total > len(items) else None
+    return message(section(f'📋 <b>Your matches</b> · {total}',
+                           '<i>Trending tokens that fit your filters right now.</i>'), *entries, more)
+
+
+def spectral_settings(user, saved=False):
+    return message(
+        '✅ <b>Saved</b>' if saved else None,
+        '⚙️ <b>Your filters</b>',
+        section('⏱ <b>Min time in trending</b>', f'{user["min_minutes"]} min'),
+        section('📈 <b>Multiplier since tracked</b>', fmt_range(user['min_mult'], user['max_mult'])),
+        section('💰 <b>Market cap</b>', fmt_usd_range(user['min_mcap'], user['max_mcap'])),
+        '<i>A token reaches you once it has been in trending for the min time and both ranges fit. '
+        'Tap a button to change a filter.</i>',
     )
 
 
 def spectral_welcome():
     return message(
-        '🔮 <b>Welcome to Spectral</b>',
-        'You will receive KOL trending tokens that match your filters, plus their events: '
-        'new KOL buys, migrations, liquidity, DEX paid, CTO and boosts.',
-        section('/settings · change your filters', '/show · tokens matching your filters now'),
+        '👋 <b>Welcome to Spectral</b>',
+        'Spectral follows hundreds of KOL wallets. When 2 or more KOLs buy the same token it '
+        'enters trending, and you get the ones that fit your filters.',
+        section('<b>What you will receive</b>',
+                '🎯 New match: a trending token that fits your filters',
+                '🟢🔵 KOL buys on the tokens you received',
+                '🎓 Migrations · 💧 Liquidity · 🦅 DEX paid',
+                '🏴‍☠️ Community takeovers · ⚡ Boosts · 📣 Ads'),
+        '<i>Updates for a token stop once it leaves your filters or trending. Tokens that already fit '
+        "right now aren't sent, so you start clean; use /show to see them.</i>",
+    )
+
+
+def spectral_help():
+    return message(
+        '🧭 <b>Commands</b>',
+        section('/settings · your filters',
+                '/show · tokens that fit your filters now',
+                '/time 10 · min minutes in trending',
+                '/range 0.7-2 · multiplier since tracked',
+                '/mcap 20k-100k · market cap'),
+        '<i>Ranges can be open: <code>20k-</code> means 20K or more, <code>-100k</code> up to 100K, '
+        '<code>any</code> no limit.</i>',
     )

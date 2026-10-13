@@ -51,7 +51,10 @@ def test_end_to_end_flow():
     async def scenario():
         tracker, out = make_tracker()
         forwarded = []
-        tracker.spectral = type('FakeSpectral', (), {'forward': lambda self, m, t: forwarded.append(t)})()
+        buys = []
+        tracker.spectral = type('FakeSpectral', (), {
+            'forward': lambda self, m, t: forwarded.append(t),
+            'on_kol_buy': lambda self, kol, wallet, *a: buys.append(wallet.label)})()
         feed = tracker.handle_raw
 
         feed(trade('s1', 'AS', 'buy', 1.0, 1000, 40))           # Alice side
@@ -80,8 +83,8 @@ def test_end_to_end_flow():
         assert len(trend_posts) == 1 and '<b>2x</b>' in trend_posts[0]
         event_posts = [text for t, text in out.posts if t == TOPIC_EVENTS]
         assert len(event_posts) == 2
-        assert any(p.startswith('🎓 <b>Migration</b>\n\n') and 'PumpSwap' in p for p in event_posts)
-        assert any(p.startswith('💧 <b>Liquidity added</b>\n\n') for p in event_posts)
+        assert any(p.startswith('🎓 <b>Migrated</b>\n<i>') and 'PumpSwap' in p for p in event_posts)
+        assert any(p.startswith('💧 <b>Liquidity added</b>\n<i>') for p in event_posts)
 
         main_post = next(text for t, text in out.posts if t == TOPIC_MAINS)
         assert 'Alice · Main wallet' in main_post
@@ -96,7 +99,8 @@ def test_end_to_end_flow():
         assert pos['sell_count'] == 1 and pos['balance'] == 600
         assert tracker.store.conn.execute('SELECT COUNT(*) FROM trades').fetchone()[0] == 4
         # Spectral gets every message except trending alerts.
-        assert len(forwarded) == len(out.posts) - 1 and not any('🚀' in t for t in forwarded)
+        assert len(forwarded) == 2 and all(t in event_posts for t in forwarded)
+        assert sorted(buys) == ['Alice', 'Alice2', 'Bob2']
 
     asyncio.run(scenario())
 

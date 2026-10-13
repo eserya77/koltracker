@@ -3,13 +3,18 @@ import sqlite3
 
 import pytest
 
+from kolbot.botapi import TelegramError
 from kolbot.db import Store
-from kolbot.spectral import (SpectralBot, matches, parse_mcap, parse_range, parse_time,
-                             settings_keyboard, show_keyboard)
+from kolbot.spectral import SpectralBot, matches, parse_bounds, parse_minutes, show_keyboard
 from kolbot.trending import TrendState
 
 MIN = 60_000
 NOW = 10_000 * MIN
+
+
+@pytest.fixture(autouse=True)
+def frozen_clock(monkeypatch):
+    monkeypatch.setattr('kolbot.spectral.now_ms', lambda: NOW)
 
 
 def user(**overrides):
@@ -44,31 +49,34 @@ def test_matches_open_market_cap_ranges():
     assert matches(user(), token, NOW, None)                           # no mcap filter
 
 
-def test_parsers():
-    assert parse_time(['12']) == 12
-    for bad in ([], ['x'], ['-1'], ['5000']):
-        with pytest.raises(ValueError):
-            parse_time(bad)
-    assert parse_range(['0.7', '2']) == (0.7, 2)
-    assert parse_range(['1x', 'any']) == (1, None)
-    assert parse_range(['any']) == (None, None)
-    assert parse_mcap(['20k', '100k']) == (20_000, 100_000)
-    assert parse_mcap(['any', '$1.5M']) == (None, 1_500_000)
-    assert parse_mcap(['20000', 'any']) == (20_000, None)
-    assert parse_mcap(['any']) == (None, None)
-    for bad in (['100k', '20k'], ['x', '1k'], ['0', '1k'], ['20k']):
-        with pytest.raises(ValueError):
-            parse_mcap(bad)
-    for bad in (['2', '1'], ['0', '2'], ['a', 'b'], ['1']):
-        with pytest.raises(ValueError):
-            parse_range(bad)
+@pytest.mark.parametrize('text, expected', [
+    ('20k-100k', (20_000, 100_000)), ('20k - 100k', (20_000, 100_000)), ('20k to 100k', (20_000, 100_000)),
+    ('20k 100k', (20_000, 100_000)), ('-100k', (None, 100_000)), ('<100k', (None, 100_000)),
+    ('20k-', (20_000, None)), ('>20k', (20_000, None)), ('$1.5M-', (1_500_000, None)),
+    ('any', (None, None)), ('any 100k', (None, 100_000)), ('20000-any', (20_000, None)),
+])
+def test_parse_mcap_ranges(text, expected):
+    assert parse_bounds(text, 'mcap') == expected
 
 
-def test_settings_keyboard_marks_current_values():
-    rows = settings_keyboard(user(min_minutes=15, min_mult=0.7, max_mcap=100_000))['inline_keyboard']
-    selected = [b['callback_data'] for row in rows for b in row if b['text'].startswith('✅')]
-    assert selected == ['set:time:15', 'set:min:0.7', 'set:max:any', 'set:minmc:any', 'set:maxmc:100000']
-    assert all(len(b['callback_data']) <= 64 for row in rows for b in row)
+@pytest.mark.parametrize('text, expected', [
+    ('0.7-2', (0.7, 2)), ('0.7x-2x', (0.7, 2)), ('1-', (1, None)), ('-3', (None, 3)), ('any', (None, None)),
+])
+def test_parse_mult_ranges(text, expected):
+    assert parse_bounds(text, 'mult') == expected
+
+
+@pytest.mark.parametrize('text', ['100k-20k', 'abc', '20k', '0-1k', '1-2-3'])
+def test_parse_bounds_rejects(text):
+    with pytest.raises(ValueError):
+        parse_bounds(text, 'mcap')
+
+
+def test_parse_minutes():
+    assert parse_minutes('12') == 12 and parse_minutes('15m') == 15
+    for bad in ('', 'x', '-1', '5000'):
+        with pytest.raises(ValueError):
+            parse_minutes(bad)
 
 
 class FakeApi:
@@ -84,6 +92,9 @@ class FakeApi:
     async def close(self):
         pass
 
+    def texts(self, chat_id):
+        return [c[2] for c in self.calls if c[0] == 'send' and c[1] == chat_id]
+
 
 class FakeDex:
     async def dex_paid(self, mint):
@@ -95,6 +106,7 @@ class FakeTracker:
         self.trends = {t.mint: t for t in trends}
         self.sol_usd = 200
         self.dex = FakeDex()
+        self.kols = {}
 
     async def token_meta(self, mint):
         return {'symbol': mint, 'name': mint.lower()}
@@ -104,13 +116,8 @@ class FakeTracker:
 
 
 def make_bot(trends):
-    store = Store(':memory:')
-    bot = SpectralBot('token', store, FakeTracker(trends))
+    bot = SpectralBot('token', Store(':memory:'), FakeTracker(trends))
     bot.api = FakeApi()
-    for chat_id, filters in ((1, {}), (2, {'max_mult': 2.0})):
-        bot.ensure_user({'id': chat_id, 'username': f'u{chat_id}'})
-        if filters:
-            bot.set_filters(chat_id, **filters)
     return bot
 
 
@@ -122,66 +129,84 @@ def drain(bot):
     return items
 
 
-def test_delivery_once_and_event_forwarding():
+def start(bot, chat_id):
+    return bot.on_message({'chat': {'id': chat_id, 'username': f'u{chat_id}'}, 'text': '/start'})
+
+
+def test_start_does_not_send_tokens_that_already_match():
     async def scenario():
-        bot = make_bot([trend('AAA', mcap=110), trend('BBB', mcap=60, age_min=3)])
+        bot = make_bot([trend('OLD', mcap=110), trend('YOUNG', mcap=60, age_min=3)])
+        await start(bot, 1)
         await bot.deliver_due(NOW)
+        assert drain(bot) == []                                  # OLD already matched: skipped
+        assert 'Welcome to Spectral' in bot.api.texts(1)[0]
+
+        await bot.deliver_due(NOW + 10 * MIN)                    # YOUNG crosses 10 min later
         sent = drain(bot)
-        # AAA (2.2x, 15m) goes to user 1 only; BBB is too young for both.
-        assert [(c, m) for c, m, _ in sent] == [(1, 'AAA')]
-        assert sent[0][2].startswith('🔮 <b>$AAA</b>') and '2.20x' in sent[0][2]
-        await bot.deliver_due(NOW + MIN)
-        assert drain(bot) == []
+        assert [(c, m) for c, m, _ in sent] == [(1, 'YOUNG')]
+        assert sent[0][2].startswith('🎯 <b>New match</b>\n<i>')
 
-        bot.forward('AAA', 'migration text')
-        bot.forward('BBB', 'not followed')
-        assert [(c, m) for c, m, _ in drain(bot)] == [(1, 'AAA')]
+        bot.forward('YOUNG', 'event')
+        bot.forward('OLD', 'not followed')
+        assert [(c, m) for c, m, _ in drain(bot)] == [(1, 'YOUNG')]
 
-        await bot.deliver_due(NOW + 10 * MIN)  # BBB now 13m old, 1.2x -> both users
-        assert sorted(c for c, m, _ in drain(bot)) == [1, 2]
-        assert bot.store.conn.execute('SELECT COUNT(*) FROM spectral_deliveries').fetchone()[0] == 3
+        await bot.on_message({'chat': {'id': 1}, 'text': '/show'})   # /show follows OLD too
+        assert 'Your matches</b> · 1' in bot.api.texts(1)[-1]  # YOUNG is 3m old at NOW
+        bot.forward('OLD', 'now followed')
+        assert [(c, m) for c, m, _ in drain(bot)] == [(1, 'OLD')]
 
     asyncio.run(scenario())
 
 
-def test_commands_and_settings_callback():
+def test_changing_filters_does_not_burst():
     async def scenario():
         bot = make_bot([trend('AAA', mcap=110)])
-        await bot.on_message({'chat': {'id': 3, 'username': 'new'}, 'text': '/range 0.7 2.5'})
-        assert (bot.users[3]['min_mult'], bot.users[3]['max_mult']) == (0.7, 2.5)
-        await bot.on_message({'chat': {'id': 3}, 'text': '/range 3 1'})
-        assert 'lower than' in bot.api.calls[-1][2]
-
-        await bot.on_callback({'id': 'q', 'data': 'set:time:30',
-                               'message': {'message_id': 9, 'chat': {'id': 3}}})
-        assert bot.users[3]['min_minutes'] == 30
-        assert bot.api.calls[-1][0] == 'editMessageText'
-        assert bot.store.spectral_user(3)['min_minutes'] == 30
-
-        await bot.on_callback({'id': 'q', 'data': 'set:maxmc:100000',
-                               'message': {'message_id': 9, 'chat': {'id': 3}}})
-        assert bot.users[3]['max_mcap'] == 100_000
-        await bot.on_message({'chat': {'id': 3}, 'text': '/mcap 20k any'})
-        saved = bot.store.spectral_user(3)
-        assert (saved['min_mcap'], saved['max_mcap']) == (20_000, None)
-        assert 'Market cap: <b>$20K or more</b>' in bot.api.calls[-1][2]
-
-        await bot.on_message({'chat': {'id': 1}, 'text': '/show'})
-        method, chat_id, text, _ = bot.api.calls[-1]
-        assert chat_id == 1 and 'Matching tokens</b> (1)' in text
-        assert 1 in bot.followers['AAA']
-        assert show_keyboard([({'symbol': 'AAA'}, bot.tracker.trends['AAA'])])['inline_keyboard'] == [
-            [{'text': '⚡ Trade $AAA on Archon',
-              'url': 'https://t.me/archont_sol_bot?start=t_8060490164_AAA'}]]
+        await start(bot, 1)
+        await bot.on_message({'chat': {'id': 1}, 'text': '/range 3-'})   # nothing matches
+        bot.tracker.trends['BBB'] = trend('BBB', mcap=200)               # 4x, already old
+        await bot.on_message({'chat': {'id': 1}, 'text': '/range any'})  # AAA and BBB match now
+        await bot.deliver_due(NOW)
+        assert drain(bot) == []
 
     asyncio.run(scenario())
+
+
+def test_typed_filters_via_buttons():
+    async def scenario():
+        bot = make_bot([])
+        await start(bot, 3)
+        await bot.on_callback({'id': 'q', 'data': 'edit:mcap', 'message': {'chat': {'id': 3}}})
+        assert 'Market cap range' in bot.api.texts(3)[-1]
+        await bot.on_message({'chat': {'id': 3}, 'text': '100k-20k'})
+        assert bot.api.texts(3)[-1].startswith('⚠️') and bot.pending[3] == 'mcap'
+        await bot.on_message({'chat': {'id': 3}, 'text': '-100k'})
+        saved = bot.store.spectral_user(3)
+        assert (saved['min_mcap'], saved['max_mcap']) == (None, 100_000)
+        assert bot.api.texts(3)[-1].startswith('✅ <b>Saved</b>') and 'Up to $100K' in bot.api.texts(3)[-1]
+        assert 3 not in bot.pending
+
+        await bot.on_callback({'id': 'q', 'data': 'edit:time', 'message': {'chat': {'id': 3}}})
+        await bot.on_message({'chat': {'id': 3}, 'text': '25'})
+        assert bot.store.spectral_user(3)['min_minutes'] == 25
+
+        await bot.on_message({'chat': {'id': 3}, 'text': '/range 0.7-2'})
+        assert (bot.users[3]['min_mult'], bot.users[3]['max_mult']) == (0.7, 2)
+        await bot.on_message({'chat': {'id': 3}, 'text': 'hello'})
+        assert '<b>Commands</b>' in bot.api.texts(3)[-1]
+
+    asyncio.run(scenario())
+
+
+def test_show_keyboard_has_archon_button_per_token():
+    state = trend('AAA')
+    assert show_keyboard([({'symbol': 'AAA'}, state, 2)])['inline_keyboard'] == [
+        [{'text': '⚡ Trade $AAA on Archon', 'url': 'https://t.me/archont_sol_bot?start=t_8060490164_AAA'}]]
 
 
 def test_blocked_user_is_deactivated():
     async def scenario():
-        from kolbot.botapi import TelegramError
-
         bot = make_bot([])
+        await start(bot, 1)
 
         async def blocked(*args, **kwargs):
             raise TelegramError('sendMessage', 403, 'Forbidden: bot was blocked by the user')
@@ -193,14 +218,52 @@ def test_blocked_user_is_deactivated():
     asyncio.run(scenario())
 
 
-def test_old_database_gets_new_trending_columns(tmp_path):
+def test_old_database_gets_new_columns(tmp_path):
     path = tmp_path / 'old.sqlite3'
     conn = sqlite3.connect(path)
     conn.execute('CREATE TABLE trending (mint TEXT PRIMARY KEY, base_mcap_sol REAL NOT NULL, '
                  'ath_mcap_sol REAL NOT NULL, entered_ts INTEGER NOT NULL, last_mult REAL NOT NULL '
                  'DEFAULT 1, active INTEGER NOT NULL DEFAULT 1, stopped_ts INTEGER)')
-    conn.execute("INSERT INTO trending(mint, base_mcap_sol, ath_mcap_sol, entered_ts) VALUES ('M', 5, 9, 1)")
+    conn.execute('CREATE TABLE spectral_deliveries (chat_id INTEGER NOT NULL, mint TEXT NOT NULL, '
+                 'ts INTEGER NOT NULL, PRIMARY KEY (chat_id, mint))')
+    conn.execute("INSERT INTO spectral_deliveries VALUES (1, 'M', 1)")
     conn.commit()
     conn.close()
-    row = Store(path).trending_rows()[0]
-    assert row['entry_mcap_sol'] is None and row['last_mcap_sol'] is None
+    store = Store(path)
+    assert store.trending_rows() == []
+    assert store.spectral_deliveries()[0]['sent'] == 1      # old deliveries keep their events
+
+
+def test_kol_buy_only_for_tokens_inside_user_filters():
+    from kolbot.kols import build_registry
+
+    async def scenario():
+        kols, wallets = build_registry([{'address': 'AM', 'name': 'Alice'}, {'address': 'BM', 'name': 'Bob'}],
+                                       [{'address': 'AS', 'name': 'Alice2'}])
+        bot = make_bot([trend('TOK', mcap=110)])  # 2.2x, $22K
+        bot.store.sync_registry(kols, wallets)
+        bot.tracker.kols = kols
+        for sig, wallet, sol in (('s1', 'AS', 1.0), ('s2', 'BM', 2.0)):
+            bot.store.record_trade(sig, wallet, 'TOK', 'buy', sol, 1000, 100, 'pump', NOW)
+        bot.store.record_trade('s3', 'BM', 'TOK', 'sell', 2.0, 1000, 100, 'pump', NOW)
+        for chat_id in (1, 2):
+            await start(bot, chat_id)
+            bot.follow(chat_id, 'TOK', NOW)
+        bot.set_filters(2, max_mcap=20_000)        # token is $22K: outside user 2's range
+        drain(bot)
+
+        trade = {'mint': 'TOK', 'wallet': 'AS', 'sol': 1.0, 'mcap_sol': 110, 'venue': 'pump'}
+        bot.on_kol_buy(kols['alice'], wallets['AS'], trade, {'symbol': 'TOK'}, True)
+        sent = drain(bot)
+        assert [c for c, _, _ in sent] == [1]
+        text = sent[0][2]
+        assert text.startswith('🔵 <b>KOL buy · side wallet</b>\n<i>Alice just entered')
+        assert '1 holding, 1 out' in text and '<b>Alice</b>' in text and 'Bob' in text and '🔴 sold' in text
+
+        bot.forward('TOK', 'event')
+        assert [c for c, _, _ in drain(bot)] == [1]
+        bot.tracker.trends['TOK'].active = False     # left trending: no more updates
+        bot.forward('TOK', 'event')
+        assert drain(bot) == []
+
+    asyncio.run(scenario())

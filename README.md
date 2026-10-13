@@ -14,4 +14,7 @@ Spectral is a second bot in the same process. Each user gets the trending tokens
 for at least their minimum time (default 10 min) with a multiplier since tracking started inside their range,
 and then every event of those tokens (KOL buys, migration, liquidity, DEX paid, CTO, boosts, ads).
 Users can also filter by USD market cap; every range can be open on either side.
-Commands: `/start`, `/settings`, `/show`, `/time 12`, `/range 0.7 2`, `/mcap 20k 100k` (`/mcap any 100k`, `/mcap 20k any`, `/mcap any`).
+Filters are typed: tap a button in `/settings` and send the value, or use `/time 10`, `/range 0.7-2`,
+`/mcap 20k-100k` (`-100k` = up to, `20k-` = or more, `any` = no limit). Tokens that already match when a
+user starts or changes filters are not sent (no burst); `/show` lists them. Events and KOL buys for a
+received token keep arriving only while it is still in trending and inside the user's ranges.
