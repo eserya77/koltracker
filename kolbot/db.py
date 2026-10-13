@@ -66,7 +66,9 @@ CREATE TABLE IF NOT EXISTS trending (
     entered_ts INTEGER NOT NULL,
     last_mult REAL NOT NULL DEFAULT 1,
     active INTEGER NOT NULL DEFAULT 1,
-    stopped_ts INTEGER
+    stopped_ts INTEGER,
+    entry_mcap_sol REAL,
+    last_mcap_sol REAL
 );
 
 CREATE TABLE IF NOT EXISTS trending_alerts (
@@ -86,6 +88,29 @@ CREATE TABLE IF NOT EXISTS events (
     payload TEXT NOT NULL,
     ts INTEGER NOT NULL
 );
+
+-- Spectral bot users and their filters (NULL bound = open range; market cap in USD).
+CREATE TABLE IF NOT EXISTS spectral_users (
+    chat_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    min_minutes INTEGER NOT NULL,
+    min_mult REAL,
+    max_mult REAL,
+    min_mcap REAL,
+    max_mcap REAL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_ts INTEGER NOT NULL
+);
+
+-- Tokens already sent to each Spectral user; their events follow.
+CREATE TABLE IF NOT EXISTS spectral_deliveries (
+    chat_id INTEGER NOT NULL REFERENCES spectral_users(chat_id),
+    mint TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, mint)
+);
+CREATE INDEX IF NOT EXISTS spectral_deliveries_mint ON spectral_deliveries(mint);
 
 CREATE TABLE IF NOT EXISTS liquidity (
     signature TEXT NOT NULL,
@@ -113,6 +138,17 @@ class Store:
         self.conn.execute('PRAGMA journal_mode=WAL')
         self.conn.execute('PRAGMA synchronous=NORMAL')
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self):
+        """Add columns introduced after a database was created."""
+        added = {'trending': ('entry_mcap_sol', 'last_mcap_sol'),
+                 'spectral_users': ('min_mcap', 'max_mcap')}
+        for table, new_columns in added.items():
+            columns = {r['name'] for r in self.conn.execute(f'PRAGMA table_info({table})')}
+            for column in new_columns:
+                if column not in columns:
+                    self.conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} REAL')
 
     def close(self):
         self.conn.close()
@@ -209,14 +245,16 @@ class Store:
     # --- trending -----------------------------------------------------------
     def start_trending(self, mint, base_mcap_sol, mcap_sol, ts):
         cur = self.conn.execute(
-            'INSERT OR IGNORE INTO trending(mint, base_mcap_sol, ath_mcap_sol, entered_ts) '
-            'VALUES (?, ?, ?, ?)', (mint, base_mcap_sol, max(base_mcap_sol, mcap_sol), ts))
+            'INSERT OR IGNORE INTO trending(mint, base_mcap_sol, ath_mcap_sol, entered_ts, '
+            'entry_mcap_sol, last_mcap_sol) VALUES (?, ?, ?, ?, ?, ?)',
+            (mint, base_mcap_sol, max(base_mcap_sol, mcap_sol), ts, mcap_sol, mcap_sol))
         return cur.rowcount == 1
 
-    def update_trending(self, mint, ath_mcap_sol, last_mult):
+    def update_trending(self, mint, ath_mcap_sol, last_mult, last_mcap_sol=None):
         self.conn.execute(
-            'UPDATE trending SET ath_mcap_sol = ?, last_mult = ? WHERE mint = ?',
-            (ath_mcap_sol, last_mult, mint))
+            'UPDATE trending SET ath_mcap_sol = ?, last_mult = ?, '
+            'last_mcap_sol = COALESCE(?, last_mcap_sol) WHERE mint = ?',
+            (ath_mcap_sol, last_mult, last_mcap_sol, mint))
 
     def stop_trending(self, mint, ath_mcap_sol, ts):
         self.conn.execute(
@@ -250,3 +288,41 @@ class Store:
             'pool_id, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (signature, wallet, mint, action, sol, tokens, venue, pool_id, ts))
         return cur.rowcount == 1
+
+    # --- spectral -----------------------------------------------------------
+    def spectral_register(self, chat_id, username, first_name, min_minutes, ts):
+        """Creates the user with default filters, or reactivates it. Returns True if new."""
+        cur = self.conn.execute(
+            'INSERT OR IGNORE INTO spectral_users(chat_id, username, first_name, min_minutes, '
+            'created_ts) VALUES (?, ?, ?, ?, ?)', (chat_id, username, first_name, min_minutes, ts))
+        if cur.rowcount == 0:
+            self.conn.execute(
+                'UPDATE spectral_users SET username = ?, first_name = ?, active = 1 WHERE chat_id = ?',
+                (username, first_name, chat_id))
+        return cur.rowcount == 1
+
+    def spectral_users(self, active_only=True):
+        sql = 'SELECT * FROM spectral_users' + (' WHERE active = 1' if active_only else '')
+        return self.conn.execute(sql).fetchall()
+
+    def spectral_user(self, chat_id):
+        return self.conn.execute(
+            'SELECT * FROM spectral_users WHERE chat_id = ?', (chat_id,)).fetchone()
+
+    def spectral_update_filters(self, chat_id, min_minutes, min_mult, max_mult, min_mcap, max_mcap):
+        self.conn.execute(
+            'UPDATE spectral_users SET min_minutes = ?, min_mult = ?, max_mult = ?, '
+            'min_mcap = ?, max_mcap = ? WHERE chat_id = ?',
+            (min_minutes, min_mult, max_mult, min_mcap, max_mcap, chat_id))
+
+    def spectral_deactivate(self, chat_id):
+        self.conn.execute('UPDATE spectral_users SET active = 0 WHERE chat_id = ?', (chat_id,))
+
+    def spectral_record_delivery(self, chat_id, mint, ts):
+        cur = self.conn.execute(
+            'INSERT OR IGNORE INTO spectral_deliveries(chat_id, mint, ts) VALUES (?, ?, ?)',
+            (chat_id, mint, ts))
+        return cur.rowcount == 1
+
+    def spectral_deliveries(self):
+        return self.conn.execute('SELECT chat_id, mint FROM spectral_deliveries').fetchall()

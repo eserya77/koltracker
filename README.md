@@ -8,4 +8,10 @@ python -m kolbot.main --dry-run  # log messages instead of sending
 python -m pytest -q
 ```
 
-Requires `TELEGRAM_BOT_TOKEN` in `.env`. Optional: `KOL_SALT_SECRET`.
+Requires `TELEGRAM_BOT_TOKEN` in `.env`. Optional: `KOL_SALT_SECRET`, and `SPECTRAL_BOT_TOKEN` to run Spectral.
+
+Spectral is a second bot in the same process. Each user gets the trending tokens that have been in trending
+for at least their minimum time (default 10 min) with a multiplier since tracking started inside their range,
+and then every event of those tokens (KOL buys, migration, liquidity, DEX paid, CTO, boosts, ads).
+Users can also filter by USD market cap; every range can be open on either side.
+Commands: `/start`, `/settings`, `/show`, `/time 12`, `/range 0.7 2`, `/mcap 20k 100k` (`/mcap any 100k`, `/mcap 20k any`, `/mcap any`).

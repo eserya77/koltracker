@@ -25,6 +25,14 @@ def test_observe_reports_highest_step_once_and_stops_at_drawdown():
     assert observe(state, 5000) is None
 
 
+def test_observe_stops_below_min_mcap_and_tracks_current():
+    state = TrendState('m', base=100, ath=100, entered_ts=0)
+    assert state.entry == 100
+    assert observe(state, 95, min_mcap=10) is None and state.mcap == 95
+    stop = observe(state, 9, min_mcap=10)
+    assert stop.kind == 'stop' and not state.active
+
+
 def test_base_prefers_side_wallets():
     rows = [
         {'role': 'main', 'mcap_x_sol': 10 * 500, 'sol_in_priced': 10},

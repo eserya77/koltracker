@@ -50,6 +50,8 @@ def make_tracker():
 def test_end_to_end_flow():
     async def scenario():
         tracker, out = make_tracker()
+        forwarded = []
+        tracker.spectral = type('FakeSpectral', (), {'forward': lambda self, m, t: forwarded.append(t)})()
         feed = tracker.handle_raw
 
         feed(trade('s1', 'AS', 'buy', 1.0, 1000, 40))           # Alice side
@@ -93,5 +95,23 @@ def test_end_to_end_flow():
         pos = tracker.store.position('AS', MINT)
         assert pos['sell_count'] == 1 and pos['balance'] == 600
         assert tracker.store.conn.execute('SELECT COUNT(*) FROM trades').fetchone()[0] == 4
+        # Spectral gets every message except trending alerts.
+        assert len(forwarded) == len(out.posts) - 1 and not any('🚀' in t for t in forwarded)
+
+    asyncio.run(scenario())
+
+
+def test_trending_needs_min_mcap_usd():
+    async def scenario():
+        tracker, out = make_tracker()
+        tracker.sol_usd = 200  # $2K floor = 10 SOL
+        tracker.handle_raw(trade('s1', 'AS', 'buy', 1.0, 1000, 8))
+        tracker.handle_raw(trade('s2', 'BS', 'buy', 1.0, 1000, 9))
+        assert MINT not in tracker.trends and not tracker.store.is_trending_known(MINT)
+        tracker.handle_raw(trade('s3', 'BM', 'buy', 1.0, 1000, 12))
+        assert tracker.trends[MINT].entry == 12
+        tracker.handle_raw(trade('s4', 'XX', 'sell', 1.0, 1000, 9.5))
+        assert MINT not in tracker.trends
+        await asyncio.sleep(0.05)
 
     asyncio.run(scenario())

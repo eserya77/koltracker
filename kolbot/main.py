@@ -12,6 +12,7 @@ from . import config
 from .db import Store
 from .dexscreener import DexScreener
 from .kols import load_registry
+from .spectral import SpectralBot
 from .telegram_out import TelegramOut
 from .tracker import Tracker, log_stats_line
 
@@ -78,6 +79,11 @@ async def run(args):
     out = TelegramOut(token, dry_run=args.dry_run)
     dex = DexScreener()
     tracker = Tracker(store, kols, wallets, out, dex)
+    spectral_token = os.environ.get('SPECTRAL_BOT_TOKEN')
+    spectral = SpectralBot(spectral_token, store, tracker, dry_run=args.dry_run) if spectral_token else None
+    tracker.spectral = spectral
+    if spectral:
+        log.info('Spectral enabled with %d active user(s)', len(spectral.users))
     on_raw = handle_raw_safely(tracker)
     started = time.monotonic()
 
@@ -88,6 +94,11 @@ async def run(args):
         asyncio.create_task(periodic(30, tracker.persist_trends)),
         asyncio.create_task(periodic(60, lambda: log.info(log_stats_line(tracker, started)))),
     ]
+    if spectral:
+        tasks += [asyncio.create_task(spectral.run_sender()),
+                  asyncio.create_task(spectral.deliver_loop())]
+        if not args.dry_run and not args.replay:
+            tasks.append(asyncio.create_task(spectral.poll_updates()))
     if args.replay:
         source = asyncio.create_task(replay(args.replay, on_raw))
     else:
@@ -105,6 +116,8 @@ async def run(args):
         await asyncio.gather(*tasks, return_exceptions=True)
         tracker.persist_trends()
         await out.close()
+        if spectral:
+            await spectral.close()
         await dex.close()
         store.close()
         if recorder:

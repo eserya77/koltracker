@@ -7,7 +7,7 @@ import time
 
 from . import formatting as fmt
 from .config import (DEX_WATCH_SECONDS, NATIVE_SOL, TOPIC_EVENTS, TOPIC_MAINS, TOPIC_SIDES,
-                     TOPIC_TRENDING, TRENDING_MIN_KOLS, USD_QUOTES, WSOL)
+                     TOPIC_TRENDING, TRENDING_MIN_KOLS, TRENDING_MIN_MCAP_USD, USD_QUOTES, WSOL)
 from .db import now_ms
 from .dexscreener import feed_dedupe_key
 from .trending import TrendState, observe, trending_base
@@ -35,6 +35,7 @@ class Tracker:
         self.wallets = wallets
         self.out = out
         self.dex = dex
+        self.spectral = None
         self.sol_usd = None
         self.trends = {}
         self.kol_mints = store.kol_mints()
@@ -44,7 +45,7 @@ class Tracker:
         for row in store.trending_rows():
             self.trends[row['mint']] = TrendState(
                 row['mint'], row['base_mcap_sol'], row['ath_mcap_sol'], row['entered_ts'],
-                row['last_mult'], True)
+                row['last_mult'], True, row['entry_mcap_sol'], row['last_mcap_sol'])
         for mint in self.kol_mints:
             for row in store.token_positions(mint):
                 self.wallet_mints.setdefault(row['wallet'], set()).add(mint)
@@ -63,6 +64,9 @@ class Tracker:
 
     def mcap_sol(self, event):
         return self.to_sol(event.get('marketCapQuote'), event.get('quoteMint'))
+
+    def min_trend_mcap_sol(self):
+        return TRENDING_MIN_MCAP_USD / self.sol_usd if self.sol_usd else None
 
     # --- stream entry point -------------------------------------------------
     def handle_raw(self, raw):
@@ -145,7 +149,7 @@ class Tracker:
         kol = self.kols[wallet.kol_id]
         kol_rows = self.store.kol_positions(kol.id, mint)
         text = fmt.buy(kol, wallet, trade, meta, kol_rows, self.sol_usd, paid, trade['ts'])
-        self.out.post(TOPIC_MAINS if wallet.role == 'main' else TOPIC_SIDES, text, mint)
+        self.publish(TOPIC_MAINS if wallet.role == 'main' else TOPIC_SIDES, text, mint)
 
     async def token_meta(self, mint):
         meta = self._meta.get(mint)
@@ -173,14 +177,18 @@ class Tracker:
         if not base:
             return
         current = mcap or base
+        floor = self.min_trend_mcap_sol()
+        if floor and current < floor:
+            return
         if self.store.start_trending(mint, base, current, ts):
-            self.trends[mint] = TrendState(mint, base, max(base, current), ts)
+            self.trends[mint] = TrendState(mint, base, max(base, current), ts,
+                                           entry=current, mcap=current)
             log.info('TRENDING START %s base %.2f SOL', mint, base)
             self.on_trend_price(mint, mcap, ts)
 
     def on_trend_price(self, mint, mcap, ts):
         state = self.trends[mint]
-        update = observe(state, mcap)
+        update = observe(state, mcap, self.min_trend_mcap_sol())
         if update is None:
             return
         if update.kind == 'stop':
@@ -188,19 +196,19 @@ class Tracker:
             del self.trends[mint]
             log.info('TRENDING STOP %s at %.2f SOL (ATH %.2f)', mint, mcap, state.ath)
             return
-        self.store.update_trending(mint, state.ath, state.last_mult)
+        self.store.update_trending(mint, state.ath, state.last_mult, state.mcap)
         self.store.record_trending_alert(mint, update.mult, update.mcap, ts)
         log.info('TRENDING %s %sx', mint, update.mult)
         self.spawn(self.announce_trend(mint, state, update, ts))
 
     async def announce_trend(self, mint, state, update, ts):
         meta = await self.token_meta(mint)
-        self.out.post(TOPIC_TRENDING, fmt.trending_step(mint, meta, state, update,
+        self.publish(TOPIC_TRENDING, fmt.trending_step(mint, meta, state, update,
                                                         self.kol_names(mint), self.sol_usd, ts), mint)
 
     def persist_trends(self):
         for state in self.trends.values():
-            self.store.update_trending(state.mint, state.ath, state.last_mult)
+            self.store.update_trending(state.mint, state.ath, state.last_mult, state.mcap)
 
     # --- events -------------------------------------------------------------
     def on_kol_create(self, event, ts):
@@ -210,7 +218,7 @@ class Tracker:
                                                    {'wallet': wallet.address}, ts):
             return
         meta = {'symbol': event.get('symbol'), 'name': event.get('name')}
-        self.out.post(TOPIC_EVENTS, fmt.kol_create(self.kols[wallet.kol_id], wallet, mint, meta,
+        self.publish(TOPIC_EVENTS, fmt.kol_create(self.kols[wallet.kol_id], wallet, mint, meta,
                                                    event, self.sol_usd, self.mcap_sol(event)), mint)
 
     def on_kol_liquidity(self, event, leg, ts):
@@ -228,7 +236,7 @@ class Tracker:
 
     async def announce_liquidity(self, wallet, mint, action, sol, tokens, event):
         meta = await self.token_meta(mint)
-        self.out.post(TOPIC_EVENTS, fmt.liquidity(self.kols[wallet.kol_id], wallet, mint, meta,
+        self.publish(TOPIC_EVENTS, fmt.liquidity(self.kols[wallet.kol_id], wallet, mint, meta,
                                                   action, sol, tokens, event), mint)
 
     def on_migration(self, event, ts):
@@ -242,7 +250,7 @@ class Tracker:
 
     async def announce_migration(self, mint, event, mcap):
         meta = await self.token_meta(mint)
-        self.out.post(TOPIC_EVENTS, fmt.migration(mint, meta, event, mcap, self.sol_usd,
+        self.publish(TOPIC_EVENTS, fmt.migration(mint, meta, event, mcap, self.sol_usd,
                                                   self.kol_names(mint)), mint)
 
     async def poll_dexscreener(self, interval):
@@ -266,7 +274,7 @@ class Tracker:
             self.dex.mark_paid(mint)
         meta = await self.token_meta(mint)
         log.info('DEX %s %s', type_, mint)
-        self.out.post(TOPIC_EVENTS, fmt.dex_event(type_, mint, meta, item, self.kol_names(mint)), mint)
+        self.publish(TOPIC_EVENTS, fmt.dex_event(type_, mint, meta, item, self.kol_names(mint)), mint)
 
     async def poll_sol_price(self, interval):
         while True:
@@ -279,6 +287,12 @@ class Tracker:
             await asyncio.sleep(interval)
 
     # --- helpers ------------------------------------------------------------
+    def publish(self, topic, text, mint):
+        """Posts to the KOL group; Spectral followers get everything except trending alerts."""
+        self.out.post(topic, text, mint)
+        if self.spectral and topic != TOPIC_TRENDING:
+            self.spectral.forward(mint, text)
+
     def kol_names(self, mint):
         return sorted({self.kols[p['kol_id']].name for p in self.store.token_positions(mint)})
 

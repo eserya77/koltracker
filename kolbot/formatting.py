@@ -260,3 +260,75 @@ def dex_event(type_, mint, meta, item, holders):
     elif type_ == 'ad':
         details = f'📣 Ad: {escape(str(item.get("type") or "ad"))} · {item.get("durationHours", "?")}h'
     return message(event_header(type_, meta, ', '.join(holders)), ca(mint), details)
+
+
+# --- Spectral ------------------------------------------------------------------
+def fmt_range(min_mult, max_mult):
+    if min_mult is None and max_mult is None:
+        return 'Any'
+    if max_mult is None:
+        return f'{fmt_mult(min_mult)} or more'
+    if min_mult is None:
+        return f'Up to {fmt_mult(max_mult)}'
+    return f'{fmt_mult(min_mult)} – {fmt_mult(max_mult)}'
+
+
+def fmt_usd_range(low, high):
+    if low is None and high is None:
+        return 'Any'
+    if high is None:
+        return f'${fmt_num(low)} or more'
+    if low is None:
+        return f'Up to ${fmt_num(high)}'
+    return f'${fmt_num(low)} – ${fmt_num(high)}'
+
+
+def spectral_token(mint, meta, state, kol_names, sol_usd, paid, now):
+    return message(
+        header('🔮', meta, ', '.join(kol_names)),
+        ca(mint),
+        section(f'⏱ In trending: {fmt_duration(now - state.entered_ts)}',
+                f'📈 Multiplier: <b>{state.mcap / state.entry:.2f}x</b> since tracked',
+                f'📊 MC: {fmt_mcap(state.mcap, sol_usd)}',
+                f'🎯 Tracked at: {fmt_mcap(state.entry, sol_usd)}',
+                f'🏔 ATH: {fmt_mcap(state.ath, sol_usd)}'),
+        dex_paid_line(paid),
+    )
+
+
+def spectral_list(items, total, sol_usd, now):
+    """items: [(meta, state)] already sorted; total counts every match."""
+    if not items:
+        return message('🔮 <b>Matching tokens</b>', 'No trending token matches your filters right now.')
+    entries = [section(f'{i}. {token_line(meta)}',
+                       f'📈 {state.mcap / state.entry:.2f}x · 📊 {fmt_mcap(state.mcap, sol_usd)} · '
+                       f'⏱ {fmt_duration(now - state.entered_ts)}',
+                       ca(state.mint))
+               for i, (meta, state) in enumerate(items, 1)]
+    more = f'+{total - len(items)} more' if total > len(items) else None
+    return message(f'🔮 <b>Matching tokens</b> ({total})', *entries, more)
+
+
+def spectral_settings(user):
+    return message(
+        '⚙️ <b>Settings</b>',
+        section(f'⏱ Min time in trending: <b>{user["min_minutes"]}m</b>',
+                f'📈 Multiplier range: <b>{fmt_range(user["min_mult"], user["max_mult"])}</b>',
+                f'💰 Market cap: <b>{fmt_usd_range(user["min_mcap"], user["max_mcap"])}</b>'),
+        'You get a token once it has been in trending at least this long, its multiplier '
+        'since tracking started is inside the range and its market cap is inside yours.',
+        section('Custom values:',
+                '<code>/time 12</code>',
+                '<code>/range 0.7 2</code> · <code>/range 1 any</code> · <code>/range any</code>',
+                '<code>/mcap 20k 100k</code> · <code>/mcap any 100k</code> · '
+                '<code>/mcap 20k any</code> · <code>/mcap any</code>'),
+    )
+
+
+def spectral_welcome():
+    return message(
+        '🔮 <b>Welcome to Spectral</b>',
+        'You will receive KOL trending tokens that match your filters, plus their events: '
+        'new KOL buys, migrations, liquidity, DEX paid, CTO and boosts.',
+        section('/settings · change your filters', '/show · tokens matching your filters now'),
+    )

@@ -38,6 +38,12 @@ class TrendState:
     entered_ts: int
     last_mult: float = 1.0
     active: bool = True
+    entry: float = None  # market cap when tracking started
+    mcap: float = None   # latest market cap
+
+    def __post_init__(self):
+        if self.entry is None:
+            self.entry = self.base
 
 
 @dataclass
@@ -48,17 +54,22 @@ class TrendUpdate:
     ath: float
 
 
-def observe(state, mcap):
-    """Feed a new market cap. Returns a TrendUpdate when something is reportable."""
+def observe(state, mcap, min_mcap=None):
+    """Feed a new market cap. Returns a TrendUpdate when something is reportable.
+
+    Tracking stops after a TRENDING_STOP_DRAWDOWN fall from the ATH or when the
+    market cap drops below min_mcap (same unit as mcap).
+    """
     if not state.active or mcap is None or mcap <= 0:
         return None
+    state.mcap = mcap
     if mcap > state.ath:
         state.ath = mcap
     step = highest_step(mcap / state.base)
     if step is not None and step > state.last_mult:
         state.last_mult = step
         return TrendUpdate('step', step, mcap, state.ath)
-    if mcap <= state.ath * (1 - TRENDING_STOP_DRAWDOWN):
+    if mcap <= state.ath * (1 - TRENDING_STOP_DRAWDOWN) or (min_mcap and mcap < min_mcap):
         state.active = False
         return TrendUpdate('stop', state.last_mult, mcap, state.ath)
     return None
