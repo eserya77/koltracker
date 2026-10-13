@@ -16,5 +16,6 @@ and then every event of those tokens (KOL buys, migration, liquidity, DEX paid, 
 Users can also filter by USD market cap; every range can be open on either side.
 Filters are typed: tap a button in `/settings` and send the value, or use `/time 10`, `/range 0.7-2`,
 `/mcap 20k-100k` (`-100k` = up to, `20k-` = or more, `any` = no limit). Tokens that already match when a
-user starts or changes filters are not sent (no burst); `/show` lists them. Events and KOL buys for a
+user starts or changes filters are not sent (no burst); `/show` lists them, 5 per page. `/venues` picks
+the venues (Pumpfun, PumpSwap, Raydium, Meteora, Orca…) a token must trade on. Events and KOL buys for a
 received token keep arriving only while it is still in trending and inside the user's ranges.

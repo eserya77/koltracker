@@ -89,7 +89,8 @@ CREATE TABLE IF NOT EXISTS events (
     ts INTEGER NOT NULL
 );
 
--- Spectral bot users and their filters (NULL bound = open range; market cap in USD).
+-- Spectral bot users and their filters (NULL bound = open range; market cap in USD;
+-- venues = comma-separated VENUE_GROUPS keys, NULL = all).
 CREATE TABLE IF NOT EXISTS spectral_users (
     chat_id INTEGER PRIMARY KEY,
     username TEXT,
@@ -99,6 +100,7 @@ CREATE TABLE IF NOT EXISTS spectral_users (
     max_mult REAL,
     min_mcap REAL,
     max_mcap REAL,
+    venues TEXT,
     active INTEGER NOT NULL DEFAULT 1,
     created_ts INTEGER NOT NULL
 );
@@ -145,7 +147,7 @@ class Store:
     def _migrate(self):
         """Add columns introduced after a database was created."""
         added = {'trending': {'entry_mcap_sol': 'REAL', 'last_mcap_sol': 'REAL'},
-                 'spectral_users': {'min_mcap': 'REAL', 'max_mcap': 'REAL'},
+                 'spectral_users': {'min_mcap': 'REAL', 'max_mcap': 'REAL', 'venues': 'TEXT'},
                  'spectral_deliveries': {'sent': 'INTEGER NOT NULL DEFAULT 1'}}
         for table, new_columns in added.items():
             columns = {r['name'] for r in self.conn.execute(f'PRAGMA table_info({table})')}
@@ -312,11 +314,11 @@ class Store:
         return self.conn.execute(
             'SELECT * FROM spectral_users WHERE chat_id = ?', (chat_id,)).fetchone()
 
-    def spectral_update_filters(self, chat_id, min_minutes, min_mult, max_mult, min_mcap, max_mcap):
+    def spectral_update_filters(self, chat_id, min_minutes, min_mult, max_mult, min_mcap, max_mcap, venues):
         self.conn.execute(
             'UPDATE spectral_users SET min_minutes = ?, min_mult = ?, max_mult = ?, '
-            'min_mcap = ?, max_mcap = ? WHERE chat_id = ?',
-            (min_minutes, min_mult, max_mult, min_mcap, max_mcap, chat_id))
+            'min_mcap = ?, max_mcap = ?, venues = ? WHERE chat_id = ?',
+            (min_minutes, min_mult, max_mult, min_mcap, max_mcap, venues, chat_id))
 
     def spectral_deactivate(self, chat_id):
         self.conn.execute('UPDATE spectral_users SET active = 0 WHERE chat_id = ?', (chat_id,))

@@ -5,7 +5,8 @@ import pytest
 
 from kolbot.botapi import TelegramError
 from kolbot.db import Store
-from kolbot.spectral import SpectralBot, matches, parse_bounds, parse_minutes, show_keyboard
+from kolbot.spectral import (COMMANDS, SpectralBot, matches, page_keyboard, parse_bounds, parse_minutes,
+                             toggle_venue)
 from kolbot.trending import TrendState
 
 MIN = 60_000
@@ -19,13 +20,14 @@ def frozen_clock(monkeypatch):
 
 def user(**overrides):
     base = {'min_minutes': 10, 'min_mult': None, 'max_mult': None, 'min_mcap': None,
-            'max_mcap': None, 'active': 1}
+            'max_mcap': None, 'venues': None, 'active': 1}
     base.update(overrides)
     return base
 
 
-def trend(mint='M', entry=50, mcap=110, age_min=15):
-    return TrendState(mint, base=40, ath=120, entered_ts=NOW - age_min * MIN, entry=entry, mcap=mcap)
+def trend(mint='M', entry=50, mcap=110, age_min=15, venue='pump-amm'):
+    return TrendState(mint, base=40, ath=120, entered_ts=NOW - age_min * MIN, entry=entry, mcap=mcap,
+                      venue=venue)
 
 
 def test_matches_time_and_multiplier_range():
@@ -197,10 +199,67 @@ def test_typed_filters_via_buttons():
     asyncio.run(scenario())
 
 
-def test_show_keyboard_has_archon_button_per_token():
-    state = trend('AAA')
-    assert show_keyboard([({'symbol': 'AAA'}, state, 2)])['inline_keyboard'] == [
-        [{'text': '⚡ Trade $AAA on Archon', 'url': 'https://t.me/archont_sol_bot?start=t_8060490164_AAA'}]]
+def test_command_menu_includes_start():
+    assert COMMANDS[0]['command'] == 'start'
+    assert {c['command'] for c in COMMANDS} >= {'start', 'settings', 'show', 'venues'}
+
+
+def test_venue_filter_and_toggle():
+    assert matches(user(venues='pumpswap'), trend(venue='pump-amm'), NOW, 200)
+    assert not matches(user(venues='pumpfun,raydium'), trend(venue='pump-amm'), NOW, 200)
+    assert matches(user(venues='raydium'), trend(venue='raydium-cpmm'), NOW, 200)
+    assert not matches(user(venues='pumpfun'), trend(venue=None), NOW, 200)
+    assert matches(user(), trend(venue=None), NOW, 200)
+
+    everything_but_pumpfun = toggle_venue(user(), 'pumpfun')
+    assert 'pumpfun' not in everything_but_pumpfun and 'pumpswap' in everything_but_pumpfun
+    assert toggle_venue(user(venues=everything_but_pumpfun), 'pumpfun') is None   # back to all
+    assert toggle_venue(user(venues='orca'), 'all') is None
+    with pytest.raises(ValueError):
+        toggle_venue(user(venues='orca'), 'orca')
+
+
+def test_page_keyboard():
+    assert page_keyboard(0, 1) == {'inline_keyboard': [[{'text': '🔄 Refresh', 'callback_data': 'page:0'}]]}
+    nav = page_keyboard(1, 3)['inline_keyboard'][0]
+    assert [b['callback_data'] for b in nav] == ['page:0', 'noop', 'page:2']
+    assert [b['text'] for b in page_keyboard(0, 3)['inline_keyboard'][0]] == ['1 / 3', 'Next ▶️']
+
+
+def test_show_paginates_without_token_buttons():
+    async def scenario():
+        bot = make_bot([trend(f'T{i}', age_min=20 + i) for i in range(12)])
+        await start(bot, 1)
+        await bot.on_message({'chat': {'id': 1}, 'text': '/show'})
+        _, chat_id, text, mint = bot.api.calls[-1]
+        assert 'Your matches</b> · 12' in text and text.count('<code>') == 5 and mint is None
+        assert 'href="https://t.me/archont_sol_bot?start=t_8060490164_T11"' in text   # oldest first
+
+        await bot.on_callback({'id': 'q', 'data': 'page:2', 'message': {'message_id': 7, 'chat': {'id': 1}}})
+        method, payload = bot.api.calls[-1]
+        assert method == 'editMessageText' and payload['message_id'] == 7
+        assert payload['text'].count('<code>') == 2 and '<b>11.</b>' in payload['text']
+        assert all('url' not in b for row in payload['reply_markup']['inline_keyboard'] for b in row)
+
+    asyncio.run(scenario())
+
+
+def test_venue_menu_callbacks():
+    async def scenario():
+        bot = make_bot([])
+        await start(bot, 1)
+        msg = {'message_id': 4, 'chat': {'id': 1}}
+        await bot.on_callback({'id': 'q', 'data': 'venues', 'message': msg})
+        assert bot.api.calls[-1][0] == 'editMessageText'
+        await bot.on_callback({'id': 'q', 'data': 'venue:pumpfun', 'message': msg})
+        assert 'pumpfun' not in bot.store.spectral_user(1)['venues']
+        assert '▫️ Pumpfun' in str(bot.api.calls[-1][1]['reply_markup'])
+        await bot.on_callback({'id': 'q', 'data': 'venue:all', 'message': msg})
+        assert bot.store.spectral_user(1)['venues'] is None
+        await bot.on_callback({'id': 'q', 'data': 'settings', 'message': msg})
+        assert 'All venues' in bot.api.calls[-1][1]['text']
+
+    asyncio.run(scenario())
 
 
 def test_blocked_user_is_deactivated():

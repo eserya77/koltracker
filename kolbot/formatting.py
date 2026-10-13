@@ -8,6 +8,7 @@ shown or linked, and KOL amounts are salted (see salt.py).
 
 from html import escape
 
+from .config import ARCHON_URL, VENUE_GROUPS
 from .salt import salted
 
 VENUES = {
@@ -351,13 +352,18 @@ def market_line(state, sol_usd):
     return f'📊 MC: <b>{fmt_mcap(state.mcap, sol_usd)}</b> · {state.mcap / state.entry:.2f}x since tracked'
 
 
+def venue_label(state):
+    return f'🏦 Venue: {venue_name(state.venue)}' if state.venue else None
+
+
 def spectral_match(mint, meta, state, kols, sol_usd, paid, now):
     return message(
         event_title('match'),
         token_block(mint, meta),
         section(market_line(state, sol_usd),
                 f'🏁 Tracked at: {fmt_mcap(state.entry, sol_usd)} · 🏔 ATH: {fmt_mcap(state.ath, sol_usd)}',
-                f'⏱ In trending: {fmt_duration(now - state.entered_ts)}'),
+                f'⏱ In trending: {fmt_duration(now - state.entered_ts)}',
+                venue_label(state)),
         kols_block(kols),
         dex_paid_line(paid),
     )
@@ -377,20 +383,33 @@ def spectral_buy(kol, wallet, trade, meta, state, kols, sol_usd, paid, first_buy
     )
 
 
-def spectral_list(items, total, sol_usd, now):
-    """items: [(meta, state, kol_count)] already sorted; total counts every match."""
-    if not items:
-        return message('📋 <b>Your matches</b>',
-                       '<i>No trending token fits your filters right now. '
-                       'New matches will arrive here automatically.</i>')
-    entries = [section(f'{i}. {token_line(meta)}',
-                       f'📊 {fmt_mcap(state.mcap, sol_usd)} · {state.mcap / state.entry:.2f}x · '
-                       f'⏱ {fmt_duration(now - state.entered_ts)} · 👥 {kol_count} KOLs',
-                       ca(state.mint))
-               for i, (meta, state, kol_count) in enumerate(items, 1)]
-    more = f'<i>+{total - len(items)} more</i>' if total > len(items) else None
-    return message(section(f'📋 <b>Your matches</b> · {total}',
-                           '<i>Trending tokens that fit your filters right now.</i>'), *entries, more)
+def archon_link(mint, meta):
+    symbol = escape((meta or {}).get('symbol') or mint[:6])
+    return f'<a href="{ARCHON_URL.format(mint=mint)}">${symbol}</a>'
+
+
+def spectral_list(items, total, start, sol_usd, now):
+    """One page of matches. items: [(meta, state, kol_count)]; start: index of the first item."""
+    title = section(f'📋 <b>Your matches</b> · {total}' if total else '📋 <b>Your matches</b>',
+                    '<i>Trending tokens that fit your filters right now. Tap a symbol to trade on Archon.</i>'
+                    if total else '<i>No trending token fits your filters right now. '
+                                  'New matches will arrive here automatically.</i>')
+    entries = []
+    for i, (meta, state, kol_count) in enumerate(items, start + 1):
+        name = escape((meta or {}).get('name') or '')
+        entries.append(section(
+            f'<b>{i}.</b> {archon_link(state.mint, meta)}' + (f' · {name}' if name else ''),
+            f'{fmt_mcap(state.mcap, sol_usd)} · {state.mcap / state.entry:.2f}x · '
+            f'{fmt_duration(now - state.entered_ts)} · {kol_count} KOLs',
+            ca(state.mint)))
+    return message(title, *entries)
+
+
+def fmt_venues(user):
+    if not user.get('venues'):
+        return 'All venues'
+    keys = user['venues'].split(',')
+    return ', '.join(VENUE_GROUPS[k][0] for k in VENUE_GROUPS if k in keys)
 
 
 def spectral_settings(user, saved=False):
@@ -400,8 +419,17 @@ def spectral_settings(user, saved=False):
         section('⏱ <b>Min time in trending</b>', f'{user["min_minutes"]} min'),
         section('📈 <b>Multiplier since tracked</b>', fmt_range(user['min_mult'], user['max_mult'])),
         section('💰 <b>Market cap</b>', fmt_usd_range(user['min_mcap'], user['max_mcap'])),
-        '<i>A token reaches you once it has been in trending for the min time and both ranges fit. '
-        'Tap a button to change a filter.</i>',
+        section('🏦 <b>Venues</b>', escape(fmt_venues(user))),
+        '<i>A token reaches you once it has been in trending for the min time, both ranges fit and it '
+        'trades on one of your venues. Tap a button to change a filter.</i>',
+    )
+
+
+def spectral_venues(user):
+    return message(
+        '🏦 <b>Venues</b>',
+        "<i>Only get tokens trading on the venues you pick. Tap a venue to turn it on or off.</i>",
+        section('<b>Selected</b>', escape(fmt_venues(user))),
     )
 
 
@@ -423,11 +451,13 @@ def spectral_welcome():
 def spectral_help():
     return message(
         '🧭 <b>Commands</b>',
-        section('/settings · your filters',
+        section('/start · start Spectral',
+                '/settings · your filters',
                 '/show · tokens that fit your filters now',
                 '/time 10 · min minutes in trending',
                 '/range 0.7-2 · multiplier since tracked',
-                '/mcap 20k-100k · market cap'),
+                '/mcap 20k-100k · market cap',
+                '/venues · pick your venues'),
         '<i>Ranges can be open: <code>20k-</code> means 20K or more, <code>-100k</code> up to 100K, '
         '<code>any</code> no limit.</i>',
     )

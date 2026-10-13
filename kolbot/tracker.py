@@ -43,9 +43,11 @@ class Tracker:
         self._meta = {}
         self._tasks = set()
         for row in store.trending_rows():
+            token = store.token(row['mint'])
             self.trends[row['mint']] = TrendState(
                 row['mint'], row['base_mcap_sol'], row['ath_mcap_sol'], row['entered_ts'],
-                row['last_mult'], True, row['entry_mcap_sol'], row['last_mcap_sol'])
+                row['last_mult'], True, row['entry_mcap_sol'], row['last_mcap_sol'],
+                token['last_venue'] if token else None)
         for mint in self.kol_mints:
             for row in store.token_positions(mint):
                 self.wallet_mints.setdefault(row['wallet'], set()).add(mint)
@@ -100,6 +102,7 @@ class Tracker:
 
         self.update_balances(event)
         if mint in self.trends and action in TRADE_ACTIONS:
+            self.trends[mint].venue = event.get('pool') or self.trends[mint].venue
             self.on_trend_price(mint, self.mcap_sol(event), ts)
 
     def update_balances(self, event):
@@ -184,7 +187,7 @@ class Tracker:
             return
         if self.store.start_trending(mint, base, current, ts):
             self.trends[mint] = TrendState(mint, base, max(base, current), ts,
-                                           entry=current, mcap=current)
+                                           entry=current, mcap=current, venue=self.store.token(mint)['last_venue'])
             log.info('TRENDING START %s base %.2f SOL', mint, base)
             self.on_trend_price(mint, mcap, ts)
 

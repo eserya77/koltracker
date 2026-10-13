@@ -35,7 +35,17 @@ SPECTRAL_DEFAULT_MIN_MINUTES = 10
 SPECTRAL_CHECK_SECONDS = 5
 # Bot API allows ~30 messages/s across all chats.
 SPECTRAL_SEND_INTERVAL_SECONDS = 0.05
-SPECTRAL_SHOW_LIMIT = 20
+SPECTRAL_PAGE_SIZE = 5
+# Venue filter options: key -> (label, PumpAPI pool values).
+VENUE_GROUPS = {
+    'pumpfun': ('Pumpfun', ('pump',)),
+    'pumpswap': ('PumpSwap', ('pump-amm',)),
+    'launchlab': ('Raydium LaunchLab', ('raydium-launchpad',)),
+    'raydium': ('Raydium AMM', ('raydium-cpmm', 'raydium-clmm', 'raydium-v4')),
+    'dbc': ('Meteora DBC', ('meteora-launchpad',)),
+    'meteora': ('Meteora AMM', ('meteora-damm-v1', 'meteora-damm-v2', 'meteora-dlmm')),
+    'orca': ('Orca', ('orca-whirlpool',)),
+}
 
 DEXSCREENER_POLL_SECONDS = 20
 SOL_PRICE_POLL_SECONDS = 60

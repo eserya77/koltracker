@@ -40,6 +40,7 @@ class TrendState:
     active: bool = True
     entry: float = None  # market cap when tracking started
     mcap: float = None   # latest market cap
+    venue: str = None    # PumpAPI pool of the latest trade
 
     def __post_init__(self):
         if self.entry is None:
