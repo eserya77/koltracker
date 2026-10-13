@@ -143,16 +143,9 @@ class Tracker:
         mint = trade['mint']
         meta, paid = await asyncio.gather(self.token_meta(mint), self.dex.dex_paid(mint))
         kol = self.kols[wallet.kol_id]
-        own = self.store.position(wallet.address, mint)
         kol_rows = self.store.kol_positions(kol.id, mint)
-        now = trade['ts']
-        if wallet.role == 'main':
-            sides = [r for r in kol_rows if r['role'] == 'side']
-            text = fmt.main_buy(kol, wallet, trade, meta, own, sides, self.sol_usd, paid, now)
-            self.out.post(TOPIC_MAINS, text, mint)
-        else:
-            text = fmt.side_buy(kol, wallet, trade, meta, own, kol_rows, self.sol_usd, paid, now)
-            self.out.post(TOPIC_SIDES, text, mint)
+        text = fmt.buy(kol, wallet, trade, meta, kol_rows, self.sol_usd, paid, trade['ts'])
+        self.out.post(TOPIC_MAINS if wallet.role == 'main' else TOPIC_SIDES, text, mint)
 
     async def token_meta(self, mint):
         meta = self._meta.get(mint)

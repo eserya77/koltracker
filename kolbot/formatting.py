@@ -1,8 +1,9 @@
 """Telegram HTML message builders.
 
-Every message opens with the token header, the KOL line and the CA, and
-separates sections with a blank line. KOL wallets are never shown or linked,
-and KOL amounts are salted (see salt.py).
+Buy and trending messages open with the token header, the KOL line and the CA;
+event messages open with the event name. Sections are separated by a blank
+line. KOL wallets are never shown or linked, and KOL amounts are salted
+(see salt.py).
 """
 
 from html import escape
@@ -10,7 +11,7 @@ from html import escape
 from .salt import salted
 
 VENUES = {
-    'pump': 'Pump.fun',
+    'pump': 'Pumpfun',
     'pump-amm': 'PumpSwap',
     'raydium-launchpad': 'Raydium LaunchLab',
     'raydium-cpmm': 'Raydium CPMM',
@@ -21,6 +22,18 @@ VENUES = {
     'meteora-damm-v2': 'Meteora DAMM v2',
     'meteora-dlmm': 'Meteora DLMM',
     'orca-whirlpool': 'Orca',
+}
+
+# Event type -> (emoji, name shown on the first line).
+EVENTS = {
+    'migrate': ('🎓', 'MIGRATION'),
+    'create': ('🧪', 'TOKEN CREATED'),
+    'add': ('💧', 'LIQUIDITY ADDED'),
+    'remove': ('🏜', 'LIQUIDITY REMOVED'),
+    'dex_paid': ('🦅', 'DEX PAID'),
+    'cto': ('🏴‍☠️', 'COMMUNITY TAKEOVER'),
+    'boost': ('⚡', 'DEX BOOST'),
+    'ad': ('📣', 'DEX AD'),
 }
 
 
@@ -72,12 +85,16 @@ def fmt_buys(count):
     return f'{count} buy' if count == 1 else f'{count} buys'
 
 
-def holding_status(position):
-    bought = position['bought_tokens']
+# --- positions -----------------------------------------------------------------
+def held_tokens(position):
+    if position['balance'] is not None:
+        return position['balance']
+    return max(position['bought_tokens'] - position['sold_tokens'], 0.0)
+
+
+def holding_status(bought, held):
     if bought <= 0:
         return '—'
-    balance = position['balance']
-    held = balance if balance is not None else max(bought - position['sold_tokens'], 0.0)
     ratio = held / bought
     if ratio >= 0.98:
         return '🟢 Holding 100%'
@@ -86,17 +103,19 @@ def holding_status(position):
     return f'🟡 Holding {ratio:.0%}'
 
 
-def avg_entry(position):
-    if position['sol_in_priced'] <= 0:
+def avg_entry(rows):
+    """SOL-weighted average entry market cap over one or more positions."""
+    priced = sum(r['sol_in_priced'] for r in rows)
+    if priced <= 0:
         return None
-    return position['mcap_x_sol'] / position['sol_in_priced']
+    return sum(r['mcap_x_sol'] for r in rows) / priced
 
 
 def position_sol(position):
     return salted(position['sol_in'], position['wallet'], position['mint'])
 
 
-# --- building blocks ---------------------------------------------------------
+# --- building blocks -----------------------------------------------------------
 def section(*lines):
     return '\n'.join(line for line in lines if line)
 
@@ -105,11 +124,29 @@ def message(*sections):
     return '\n\n'.join(part for part in sections if part)
 
 
-def header(icon, meta, kol_text):
+def token_line(meta):
     symbol = escape((meta or {}).get('symbol') or '???')
     name = escape((meta or {}).get('name') or '')
-    title = f'{icon} <b>${symbol}</b>' + (f' | {name}' if name else '')
-    return section(title, f'💳 <b>{escape(kol_text)}</b>' if kol_text else None)
+    return f'<b>${symbol}</b>' + (f' | {name}' if name else '')
+
+
+def kol_line(text):
+    return f'💳 <b>{escape(text)}</b>' if text else None
+
+
+def wallet_role(kol, wallet):
+    if wallet.role == 'main':
+        return f'{kol.name} · Main wallet'
+    return f'{kol.name} · Side wallet ({wallet.label})'
+
+
+def header(icon, meta, kol_text):
+    return section(f'{icon} {token_line(meta)}', kol_line(kol_text))
+
+
+def event_header(type_, meta, kol_text):
+    icon, name = EVENTS[type_]
+    return section(f'{icon} <b>{name}</b>', token_line(meta), kol_line(kol_text))
 
 
 def ca(mint):
@@ -129,59 +166,48 @@ def trade_block(trade, sol_usd):
                    f'🏦 {venue_name(trade["venue"])}')
 
 
-def position_block(title, position, sol_usd, now=None):
-    holding_for = None
-    if now is not None and position['buy_count'] > 1 and position['first_buy_ts']:
-        holding_for = f'Holding for: {fmt_duration(now - position["first_buy_ts"])}'
-    return section(f'<b>{title}</b>',
-                   f'Total: {fmt_sol(position_sol(position))} · {fmt_buys(position["buy_count"])}',
-                   f'Avg entry: {fmt_mcap(avg_entry(position), sol_usd)}',
-                   holding_for,
-                   f'Status: {holding_status(position)}')
-
-
-def wallets_quote(title, rows, sol_usd):
-    """Collapsible Telegram quote with one entry per wallet."""
+def group_block(title, rows, sol_usd, now):
+    """Combined position of a set of wallets (the main, or all side wallets)."""
     if not rows:
+        return section(f'<b>{title}</b>', 'No position')
+    bought = sum(r['bought_tokens'] for r in rows)
+    first_buy = min((r['first_buy_ts'] for r in rows if r['first_buy_ts']), default=None)
+    holding_for = None
+    if first_buy and now - first_buy >= 60_000:
+        holding_for = f'Holding for: {fmt_duration(now - first_buy)}'
+    return section(f'<b>{title}</b>',
+                   f'Total: {fmt_sol(sum(position_sol(r) for r in rows))} · '
+                   f'{fmt_buys(sum(r["buy_count"] for r in rows))}',
+                   f'Avg entry: {fmt_mcap(avg_entry(rows), sol_usd)}',
+                   holding_for,
+                   f'Status: {holding_status(bought, sum(held_tokens(r) for r in rows))}')
+
+
+def side_breakdown(rows, sol_usd):
+    """Collapsible per-wallet detail; only useful with two or more side wallets."""
+    if len(rows) < 2:
         return None
-    entries = [section(f'<b>{escape(row["label"])}</b>',
-                       f'{fmt_sol(position_sol(row))} · {fmt_buys(row["buy_count"])}',
-                       f'Avg entry: {fmt_mcap(avg_entry(row), sol_usd)}',
-                       holding_status(row))
-               for row in rows]
-    return f'<blockquote expandable><b>{title}</b>\n\n' + '\n\n'.join(entries) + '</blockquote>'
+    entries = [section(f'<b>{escape(r["label"])}</b>',
+                       f'{fmt_sol(position_sol(r))} · {fmt_buys(r["buy_count"])}',
+                       f'Avg entry: {fmt_mcap(avg_entry([r]), sol_usd)}',
+                       holding_status(r['bought_tokens'], held_tokens(r)))
+               for r in rows]
+    return '<blockquote expandable><b>🔍 Side wallet breakdown</b>\n\n' + '\n\n'.join(entries) + '</blockquote>'
 
 
-# --- messages ----------------------------------------------------------------
-def main_buy(kol, wallet, trade, meta, own, sides, sol_usd, paid, now):
+# --- messages ------------------------------------------------------------------
+def buy(kol, wallet, trade, meta, kol_rows, sol_usd, paid, now):
+    """Same layout for main and side buys; only the icon and buyer line differ."""
+    mains = [r for r in kol_rows if r['role'] == 'main']
+    sides = [r for r in kol_rows if r['role'] == 'side']
+    side_title = f'🕶 Side wallets ({len(sides)})' if sides else '🕶 Side wallets'
     return message(
-        header('🟢', meta, kol.name),
+        header('🟢' if wallet.role == 'main' else '🔵', meta, wallet_role(kol, wallet)),
         ca(trade['mint']),
         trade_block(trade, sol_usd),
-        position_block('👤 Main wallet', own, sol_usd, now),
-        wallets_quote(f'🕶 Side wallets ({len(sides)})', sides, sol_usd),
-        dex_paid_line(paid),
-    )
-
-
-def side_buy(kol, wallet, trade, meta, own, kol_rows, sol_usd, paid, now):
-    side_rows = [r for r in kol_rows if r['role'] == 'side']
-    main_rows = [r for r in kol_rows if r['role'] == 'main']
-    others = [r for r in side_rows if r['wallet'] != wallet.address]
-    totals = section(
-        f'<b>📦 {escape(kol.name)} totals</b>',
-        f'Side wallets: {fmt_sol(sum(position_sol(r) for r in side_rows))} · '
-        f'{fmt_buys(sum(r["buy_count"] for r in side_rows))} · {len(side_rows)} '
-        f'{"wallet" if len(side_rows) == 1 else "wallets"}',
-        *(f'Main wallet: {fmt_sol(position_sol(r))} · {holding_status(r)}' for r in main_rows),
-    )
-    return message(
-        header('🔵', meta, wallet.label),
-        ca(trade['mint']),
-        trade_block(trade, sol_usd),
-        position_block('👤 This wallet', own, sol_usd, now),
-        totals,
-        wallets_quote(f'🕶 Other side wallets ({len(others)})', others, sol_usd),
+        group_block('👤 Main wallet', mains, sol_usd, now),
+        group_block(side_title, sides, sol_usd, now),
+        side_breakdown(sides, sol_usd),
         dex_paid_line(paid),
     )
 
@@ -200,9 +226,9 @@ def trending_step(mint, meta, state, update, kol_names, sol_usd, now):
 def migration(mint, meta, event, mcap_sol, sol_usd, holders):
     burned = event.get('burnedLiquidity')
     return message(
-        header('🎓', meta, ', '.join(holders)),
+        event_header('migrate', meta, ', '.join(holders)),
         ca(mint),
-        section(f'🎓 <b>Migrated to {venue_name(event.get("pool"))}</b>',
+        section(f'🏦 New pool: {venue_name(event.get("pool"))}',
                 f'📊 MC {fmt_mcap(mcap_sol, sol_usd)}',
                 f'🔥 Burned liquidity: {escape(str(burned))}' if burned is not None else None),
     )
@@ -210,35 +236,27 @@ def migration(mint, meta, event, mcap_sol, sol_usd, holders):
 
 def kol_create(kol, wallet, mint, meta, event, sol_usd, mcap_sol):
     return message(
-        header('🆕', meta, wallet.label),
+        event_header('create', meta, wallet_role(kol, wallet)),
         ca(mint),
-        section('🆕 <b>Token created</b>',
-                f'🏦 {venue_name(event.get("pool"))}',
+        section(f'🏦 {venue_name(event.get("pool"))}',
                 f'📊 MC {fmt_mcap(mcap_sol, sol_usd)}'),
     )
 
 
 def liquidity(kol, wallet, mint, meta, action, sol, tokens, event):
-    icon, title = ('💧', 'Liquidity added') if action == 'add' else ('🏜', 'Liquidity removed')
     return message(
-        header(icon, meta, wallet.label),
+        event_header(action, meta, wallet_role(kol, wallet)),
         ca(mint),
-        section(f'{icon} <b>{title}</b>',
-                f'💰 {fmt_sol(salted(sol, wallet.address, mint))} + '
+        section(f'💰 {fmt_sol(salted(sol, wallet.address, mint))} + '
                 f'{fmt_num(salted(tokens or 0, wallet.address, mint))} tokens',
                 f'🏦 {venue_name(event.get("pool"))}'),
     )
 
 
 def dex_event(type_, mint, meta, item, holders):
-    if type_ == 'dex_paid':
-        icon, details = '🦅', section('🦅 <b>DEX Paid</b>')
-    elif type_ == 'cto':
-        icon, details = '🏴', section('🏴 <b>Community takeover (CTO)</b>')
-    elif type_ == 'boost':
-        icon, details = '⚡', section('⚡ <b>Boost</b>',
-                                      f'+{item.get("amount", "?")} (total {item.get("totalAmount", "?")})')
-    else:
-        icon, details = '📣', section('📣 <b>Ad</b>',
-                                      f'{escape(str(item.get("type") or "ad"))} · {item.get("durationHours", "?")}h')
-    return message(header(icon, meta, ', '.join(holders)), ca(mint), details)
+    details = None
+    if type_ == 'boost':
+        details = f'⚡ +{item.get("amount", "?")} (total {item.get("totalAmount", "?")})'
+    elif type_ == 'ad':
+        details = f'📣 {escape(str(item.get("type") or "ad"))} · {item.get("durationHours", "?")}h'
+    return message(event_header(type_, meta, ', '.join(holders)), ca(mint), details)

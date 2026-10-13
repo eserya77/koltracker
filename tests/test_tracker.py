@@ -78,13 +78,18 @@ def test_end_to_end_flow():
         assert len(trend_posts) == 1 and '<b>2x</b>' in trend_posts[0]
         event_posts = [text for t, text in out.posts if t == TOPIC_EVENTS]
         assert len(event_posts) == 2
-        assert any('Migrated to PumpSwap' in p for p in event_posts)
-        assert any('Liquidity added' in p for p in event_posts)
+        assert any(p.startswith('🎓 <b>MIGRATION</b>') and 'PumpSwap' in p for p in event_posts)
+        assert any(p.startswith('💧 <b>LIQUIDITY ADDED</b>') for p in event_posts)
 
         main_post = next(text for t, text in out.posts if t == TOPIC_MAINS)
-        assert '<blockquote expandable>' in main_post and 'Alice2' in main_post
-        assert 'Avg entry: 40 SOL' in main_post
-        assert 'href' not in main_post
+        assert 'Alice · Main wallet' in main_post
+        assert 'Side wallets (1)' in main_post and 'Avg entry: 40 SOL' in main_post
+        assert 'Avg entry: 50 SOL' in main_post and 'href' not in main_post
+        side_post = next(text for t, text in out.posts if t == TOPIC_SIDES)
+        assert 'Alice · Side wallet (Alice2)' in side_post
+        # Main and side buys share the same layout.
+        for post in (main_post, side_post):
+            assert '<b>👤 Main wallet</b>' in post and '<b>🕶 Side wallets' in post
         pos = tracker.store.position('AS', MINT)
         assert pos['sell_count'] == 1 and pos['balance'] == 600
         assert tracker.store.conn.execute('SELECT COUNT(*) FROM trades').fetchone()[0] == 4
