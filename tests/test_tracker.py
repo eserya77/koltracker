@@ -53,7 +53,7 @@ def test_end_to_end_flow():
         forwarded = []
         buys = []
         tracker.spectral = type('FakeSpectral', (), {
-            'forward': lambda self, m, t: forwarded.append(t),
+            'forward': lambda self, m, t, kind: forwarded.append(t),
             'on_kol_buy': lambda self, kol, wallet, *a: buys.append(wallet.label)})()
         feed = tracker.handle_raw
 
@@ -83,8 +83,8 @@ def test_end_to_end_flow():
         assert len(trend_posts) == 1 and '<b>2x</b>' in trend_posts[0]
         event_posts = [text for t, text in out.posts if t == TOPIC_EVENTS]
         assert len(event_posts) == 2
-        assert any(p.startswith('🎓 <b>Migrated</b>\n<i>') and 'PumpSwap' in p for p in event_posts)
-        assert any(p.startswith('💧 <b>Liquidity added</b>\n<i>') for p in event_posts)
+        assert any(p.startswith('🎓 <b>$TEST migrated</b>\n<i>') and 'PumpSwap' in p for p in event_posts)
+        assert any(p.startswith('💧 <b>Bob added liquidity to $TEST</b>\n<i>') for p in event_posts)
 
         main_post = next(text for t, text in out.posts if t == TOPIC_MAINS)
         assert 'Alice · Main wallet' in main_post
@@ -116,6 +116,34 @@ def test_trending_needs_min_mcap_usd():
         assert tracker.trends[MINT].entry == 12
         tracker.handle_raw(trade('s4', 'XX', 'sell', 1.0, 1000, 9.5))
         assert MINT not in tracker.trends
+        await asyncio.sleep(0.05)
+
+    asyncio.run(scenario())
+
+
+def test_single_kol_tokens_are_watched_until_trending():
+    async def scenario():
+        tracker, out = make_tracker()
+        tracker.handle_raw(trade('s1', 'AS', 'buy', 1.0, 1000, 40))
+        assert MINT in tracker.watch and tracker.watch[MINT].kols == 1 and MINT not in tracker.trends
+        tracker.handle_raw(trade('s2', 'AM', 'buy', 1.0, 1000, 50))        # same KOL: still watched
+        assert tracker.watch[MINT].kols == 1 and tracker.watch[MINT].mcap == 50
+        tracker.handle_raw(trade('s3', 'BS', 'buy', 1.0, 1000, 60))        # second KOL: trending
+        assert MINT not in tracker.watch and tracker.trends[MINT].kols == 2
+        assert tracker.tracked(MINT) is tracker.trends[MINT]
+        await asyncio.sleep(0.05)
+        assert not any(topic == TOPIC_TRENDING for topic, _ in out.posts)   # 1.2x: no alert yet
+
+    asyncio.run(scenario())
+
+
+def test_watched_token_stops_after_drawdown():
+    async def scenario():
+        tracker, _ = make_tracker()
+        tracker.handle_raw(trade('s1', 'AS', 'buy', 1.0, 1000, 40))
+        tracker.handle_raw(trade('s2', 'XX', 'buy', 1.0, 1000, 100))
+        tracker.handle_raw(trade('s3', 'XX', 'sell', 1.0, 1000, 29))
+        assert MINT not in tracker.watch
         await asyncio.sleep(0.05)
 
     asyncio.run(scenario())

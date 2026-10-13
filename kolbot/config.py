@@ -32,6 +32,17 @@ TRENDING_MIN_MCAP_USD = 2_000
 
 # Spectral: second bot that DMs its users the trending tokens matching their filters.
 SPECTRAL_DEFAULT_MIN_MINUTES = 10
+SPECTRAL_DEFAULT_MIN_KOLS = 2
+# Updates a Spectral user can turn on or off: key -> label.
+ALERT_TYPES = {
+    'buy': 'KOL buys',
+    'migrate': 'Migrations',
+    'liquidity': 'Liquidity',
+    'dex_paid': 'DEX paid',
+    'cto': 'Takeovers',
+    'boost': 'Boosts',
+    'ad': 'Ads',
+}
 SPECTRAL_CHECK_SECONDS = 5
 # Bot API allows ~30 messages/s across all chats.
 SPECTRAL_SEND_INTERVAL_SECONDS = 0.05

@@ -101,6 +101,8 @@ CREATE TABLE IF NOT EXISTS spectral_users (
     min_mcap REAL,
     max_mcap REAL,
     venues TEXT,
+    min_kols INTEGER NOT NULL DEFAULT 2,
+    muted TEXT,
     active INTEGER NOT NULL DEFAULT 1,
     created_ts INTEGER NOT NULL
 );
@@ -147,7 +149,8 @@ class Store:
     def _migrate(self):
         """Add columns introduced after a database was created."""
         added = {'trending': {'entry_mcap_sol': 'REAL', 'last_mcap_sol': 'REAL'},
-                 'spectral_users': {'min_mcap': 'REAL', 'max_mcap': 'REAL', 'venues': 'TEXT'},
+                 'spectral_users': {'min_mcap': 'REAL', 'max_mcap': 'REAL', 'venues': 'TEXT',
+                                    'min_kols': 'INTEGER NOT NULL DEFAULT 2', 'muted': 'TEXT'},
                  'spectral_deliveries': {'sent': 'INTEGER NOT NULL DEFAULT 1'}}
         for table, new_columns in added.items():
             columns = {r['name'] for r in self.conn.execute(f'PRAGMA table_info({table})')}
@@ -314,11 +317,15 @@ class Store:
         return self.conn.execute(
             'SELECT * FROM spectral_users WHERE chat_id = ?', (chat_id,)).fetchone()
 
-    def spectral_update_filters(self, chat_id, min_minutes, min_mult, max_mult, min_mcap, max_mcap, venues):
+    SPECTRAL_FILTERS = ('min_minutes', 'min_mult', 'max_mult', 'min_mcap', 'max_mcap', 'venues',
+                        'min_kols', 'muted')
+
+    def spectral_update_filters(self, chat_id, user):
+        """Saves every filter column of the user dict."""
+        columns = self.SPECTRAL_FILTERS
         self.conn.execute(
-            'UPDATE spectral_users SET min_minutes = ?, min_mult = ?, max_mult = ?, '
-            'min_mcap = ?, max_mcap = ?, venues = ? WHERE chat_id = ?',
-            (min_minutes, min_mult, max_mult, min_mcap, max_mcap, venues, chat_id))
+            f'UPDATE spectral_users SET {", ".join(f"{c} = ?" for c in columns)} WHERE chat_id = ?',
+            (*(user[c] for c in columns), chat_id))
 
     def spectral_deactivate(self, chat_id):
         self.conn.execute('UPDATE spectral_users SET active = 0 WHERE chat_id = ?', (chat_id,))

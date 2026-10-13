@@ -38,6 +38,8 @@ class Tracker:
         self.spectral = None
         self.sol_usd = None
         self.trends = {}
+        # Tokens bought by a single KOL: tracked for Spectral only (min KOLs = 1), never posted.
+        self.watch = {}
         self.kol_mints = store.kol_mints()
         self.wallet_mints = {}
         self._meta = {}
@@ -47,7 +49,7 @@ class Tracker:
             self.trends[row['mint']] = TrendState(
                 row['mint'], row['base_mcap_sol'], row['ath_mcap_sol'], row['entered_ts'],
                 row['last_mult'], True, row['entry_mcap_sol'], row['last_mcap_sol'],
-                token['last_venue'] if token else None)
+                token['last_venue'] if token else None, self.kol_count(row['mint']))
         for mint in self.kol_mints:
             for row in store.token_positions(mint):
                 self.wallet_mints.setdefault(row['wallet'], set()).add(mint)
@@ -104,6 +106,12 @@ class Tracker:
         if mint in self.trends and action in TRADE_ACTIONS:
             self.trends[mint].venue = event.get('pool') or self.trends[mint].venue
             self.on_trend_price(mint, self.mcap_sol(event), ts)
+        elif mint in self.watch and action in TRADE_ACTIONS:
+            state = self.watch[mint]
+            state.venue = event.get('pool') or state.venue
+            update = observe(state, self.mcap_sol(event), self.min_trend_mcap_sol())
+            if update and update.kind == 'stop':
+                del self.watch[mint]
 
     def update_balances(self, event):
         post = event.get('postBalances')
@@ -142,6 +150,7 @@ class Tracker:
         if side != 'buy':
             return
         self.maybe_start_trending(mint, mcap, ts)
+        self.update_tracked(mint, mcap, ts)
         trade = {'mint': mint, 'wallet': wallet.address, 'sol': sol, 'mcap_sol': mcap,
                  'venue': venue, 'signature': event.get('signature'), 'ts': ts}
         self.spawn(self.announce_buy(wallet, trade))
@@ -152,7 +161,7 @@ class Tracker:
         kol = self.kols[wallet.kol_id]
         kol_rows = self.store.kol_positions(kol.id, mint)
         text = fmt.buy(kol, wallet, trade, meta, kol_rows, self.sol_usd, paid, trade['ts'])
-        self.publish(TOPIC_MAINS if wallet.role == 'main' else TOPIC_SIDES, text, mint, forward=False)
+        self.publish(TOPIC_MAINS if wallet.role == 'main' else TOPIC_SIDES, text, mint)
         if self.spectral:
             self.spectral.on_kol_buy(kol, wallet, trade, meta, paid)
 
@@ -172,6 +181,29 @@ class Tracker:
         return meta
 
     # --- trending -----------------------------------------------------------
+    def kol_count(self, mint):
+        return len({p['kol_id'] for p in self.store.token_positions(mint)})
+
+    def tracked(self, mint):
+        """Trending or single-KOL state of a token, if it is being tracked."""
+        return self.trends.get(mint) or self.watch.get(mint)
+
+    def candidates(self):
+        return list(self.trends.values()) + list(self.watch.values())
+
+    def update_tracked(self, mint, mcap, ts):
+        """After a KOL buy: refresh the KOL count, and watch tokens with a single KOL."""
+        count = self.kol_count(mint)
+        if mint in self.trends:
+            self.trends[mint].kols = count
+        elif count >= TRENDING_MIN_KOLS:
+            self.watch.pop(mint, None)
+        elif mint not in self.watch and mcap:
+            floor = self.min_trend_mcap_sol()
+            if not floor or mcap >= floor:
+                self.watch[mint] = TrendState(mint, mcap, mcap, ts, entry=mcap, mcap=mcap,
+                                              venue=self.store.token(mint)['last_venue'], kols=count)
+
     def maybe_start_trending(self, mint, mcap, ts):
         if mint in self.trends or self.store.is_trending_known(mint):
             return
@@ -186,8 +218,10 @@ class Tracker:
         if floor and current < floor:
             return
         if self.store.start_trending(mint, base, current, ts):
-            self.trends[mint] = TrendState(mint, base, max(base, current), ts,
-                                           entry=current, mcap=current, venue=self.store.token(mint)['last_venue'])
+            self.watch.pop(mint, None)
+            self.trends[mint] = TrendState(mint, base, max(base, current), ts, entry=current, mcap=current,
+                                           venue=self.store.token(mint)['last_venue'],
+                                           kols=self.kol_count(mint))
             log.info('TRENDING START %s base %.2f SOL', mint, base)
             self.on_trend_price(mint, mcap, ts)
 
@@ -242,7 +276,7 @@ class Tracker:
     async def announce_liquidity(self, wallet, mint, action, sol, tokens, event):
         meta = await self.token_meta(mint)
         self.publish(TOPIC_EVENTS, fmt.liquidity(self.kols[wallet.kol_id], wallet, mint, meta,
-                                                  action, sol, tokens, event), mint)
+                                                  action, sol, tokens, event), mint, kind='liquidity')
 
     def on_migration(self, event, ts):
         mint = event['mint']
@@ -256,7 +290,7 @@ class Tracker:
     async def announce_migration(self, mint, event, mcap):
         meta = await self.token_meta(mint)
         self.publish(TOPIC_EVENTS, fmt.migration(mint, meta, event, mcap, self.sol_usd,
-                                                  self.kol_names(mint)), mint)
+                                                  self.kol_names(mint)), mint, kind='migrate')
 
     async def poll_dexscreener(self, interval):
         while True:
@@ -279,7 +313,8 @@ class Tracker:
             self.dex.mark_paid(mint)
         meta = await self.token_meta(mint)
         log.info('DEX %s %s', type_, mint)
-        self.publish(TOPIC_EVENTS, fmt.dex_event(type_, mint, meta, item, self.kol_names(mint)), mint)
+        self.publish(TOPIC_EVENTS, fmt.dex_event(type_, mint, meta, item, self.kol_names(mint)), mint,
+                     kind=type_)
 
     async def poll_sol_price(self, interval):
         while True:
@@ -292,11 +327,11 @@ class Tracker:
             await asyncio.sleep(interval)
 
     # --- helpers ------------------------------------------------------------
-    def publish(self, topic, text, mint, forward=True):
-        """Posts to the KOL group and forwards events to Spectral (never trending alerts)."""
+    def publish(self, topic, text, mint, kind=None):
+        """Posts to the KOL group; events with a kind (ALERT_TYPES key) also go to Spectral."""
         self.out.post(topic, text, mint)
-        if self.spectral and forward and topic != TOPIC_TRENDING:
-            self.spectral.forward(mint, text)
+        if self.spectral and kind:
+            self.spectral.forward(mint, text, kind)
 
     def kol_names(self, mint):
         return sorted({self.kols[p['kol_id']].name for p in self.store.token_positions(mint)})

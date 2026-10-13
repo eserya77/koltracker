@@ -1,17 +1,17 @@
-"""Spectral: a second bot that DMs each user the trending tokens matching their filters.
+"""Spectral: a second bot that DMs each user the KOL tokens matching their filters.
 
-A token is sent once per user, when it has been in trending for at least the
-user's minimum time, its multiplier since tracking started (current MC / MC
-when trending began) and its USD market cap are inside the user's ranges, and
-it trades on one of the user's venues. Any range bound may be open.
+Filters: minimum time tracked, minimum number of distinct KOLs, multiplier
+since tracking started (current MC / MC when tracking began), USD market cap
+and venues. Range bounds may be open. Tokens with 2+ KOLs are the KOL trending
+tokens; tokens with a single KOL are tracked too, so "min KOLs = 1" works.
 
-Tokens that already match when a user starts the bot or changes filters are
-marked as seen without being sent, so there is no burst; /show lists them.
+A token is sent once per user. Tokens that already match when a user starts
+the bot or changes filters are marked as seen without being sent, so there is
+no burst; /show lists them.
 
-After a token is sent, the user also gets its events (KOL buys, migration,
-KOL liquidity, DEX paid, CTO, boosts, ads) for as long as the token is still in
-trending and fits the user's ranges and venues. Trending multiplier alerts are
-not forwarded.
+After a token is sent, the user also gets its updates (KOL buys, migration,
+KOL liquidity, DEX paid, CTO, boosts, ads) for as long as it is still tracked
+and fits the user's filters. Each update type can be turned off.
 """
 
 import asyncio
@@ -20,44 +20,29 @@ import time
 
 from . import formatting as fmt
 from .botapi import BotApi, TelegramError
-from .config import (MAX_MESSAGE_AGE_SECONDS, SPECTRAL_CHECK_SECONDS, SPECTRAL_DEFAULT_MIN_MINUTES,
-                     SPECTRAL_PAGE_SIZE, SPECTRAL_SEND_INTERVAL_SECONDS, VENUE_GROUPS)
+from .config import (ALERT_TYPES, MAX_MESSAGE_AGE_SECONDS, SPECTRAL_CHECK_SECONDS,
+                     SPECTRAL_DEFAULT_MIN_MINUTES, SPECTRAL_PAGE_SIZE, SPECTRAL_SEND_INTERVAL_SECONDS,
+                     VENUE_GROUPS)
 from .db import now_ms
 
 log = logging.getLogger(__name__)
 
 COMMANDS = [
-    {'command': 'start', 'description': 'Start Spectral'},
-    {'command': 'settings', 'description': 'See and change your filters'},
+    {'command': 'start', 'description': 'Your filters'},
     {'command': 'show', 'description': 'Tokens that fit your filters now'},
-    {'command': 'time', 'description': 'Min minutes in trending, e.g. /time 10'},
-    {'command': 'range', 'description': 'Multiplier range, e.g. /range 0.7-2'},
-    {'command': 'mcap', 'description': 'Market cap range, e.g. /mcap 20k-100k'},
-    {'command': 'venues', 'description': 'Pick the venues you want'},
+    {'command': 'time', 'description': 'Min minutes tracked, e.g. /time 10'},
+    {'command': 'kols', 'description': 'Min KOLs, e.g. /kols 3'},
+    {'command': 'range', 'description': 'Multiplier, e.g. /range 0.7, 2'},
+    {'command': 'mcap', 'description': 'Market cap, e.g. /mcap 20k, 100k'},
+    {'command': 'venues', 'description': 'Pick venues'},
+    {'command': 'alerts', 'description': 'Turn updates on or off'},
+    {'command': 'help', 'description': 'How Spectral works'},
 ]
+TYPED_FIELDS = ('time', 'kols', 'mult', 'mcap')
 MAX_MINUTES = 24 * 60
+MAX_KOLS = 50
 _SUFFIXES = {'k': 1e3, 'm': 1e6, 'b': 1e9}
 POOL_GROUP = {pool: key for key, (_, pools) in VENUE_GROUPS.items() for pool in pools}
-
-# Filter waiting for a typed value -> prompt.
-PROMPTS = {
-    'time': ('⏱ <b>Min time in trending</b>\n\n'
-             'Send the minimum minutes a token must have been in trending.\n\n'
-             'Example: <code>10</code>'),
-    'mult': ('📈 <b>Multiplier range</b>\n\n'
-             'Multiplier = current market cap ÷ market cap when trending started.\n'
-             'Send a range; leave a side empty to keep it open.\n\n'
-             '<code>0.7-2</code> · between 0.7x and 2x\n'
-             '<code>1-</code> · 1x or more\n'
-             '<code>-3</code> · up to 3x\n'
-             '<code>any</code> · no limit'),
-    'mcap': ('💰 <b>Market cap range (USD)</b>\n\n'
-             'Send a range; leave a side empty to keep it open.\n\n'
-             '<code>20k-100k</code> · between $20K and $100K\n'
-             '<code>-100k</code> · up to $100K\n'
-             '<code>20k-</code> · $20K or more\n'
-             '<code>any</code> · no limit'),
-}
 
 
 # --- filters -------------------------------------------------------------------
@@ -71,15 +56,23 @@ def _in_range(value, low, high):
     return (low is None or value >= low) and (high is None or value <= high)
 
 
+def _keys(value):
+    return set(value.split(',')) - {''} if value else set()
+
+
 def user_venues(user):
     """Selected venue keys, or None for all venues."""
-    return set(user['venues'].split(',')) if user.get('venues') else None
+    return _keys(user.get('venues')) or None
+
+
+def alert_on(user, kind):
+    return kind not in _keys(user.get('muted'))
 
 
 def fits(user, state, sol_usd):
-    """True while a token is in trending, inside the user's ranges and on one of their venues."""
+    """True while a token is tracked and inside the user's KOL, range and venue filters."""
     mult = multiplier(state)
-    if mult is None or not state.active:
+    if mult is None or not state.active or state.kols < user['min_kols']:
         return False
     if not _in_range(mult, user['min_mult'], user['max_mult']):
         return False
@@ -92,14 +85,21 @@ def fits(user, state, sol_usd):
 
 
 def matches(user, state, now, sol_usd):
-    """fits() plus the minimum time in trending."""
+    """fits() plus the minimum time tracked."""
     return now - state.entered_ts >= user['min_minutes'] * 60_000 and fits(user, state, sol_usd)
 
 
 def parse_minutes(text):
-    text = text.strip().lower().removesuffix('m').strip()
+    text = text.strip().lower().removesuffix('min').removesuffix('m').strip()
     if not text.isdigit() or int(text) > MAX_MINUTES:
-        raise ValueError(f'Send a whole number of minutes between 0 and {MAX_MINUTES}, e.g. 10')
+        raise ValueError(f'Send a whole number of minutes between 0 and {MAX_MINUTES}, like <code>10</code>.')
+    return int(text)
+
+
+def parse_kols(text):
+    text = text.strip().rstrip('+').strip()
+    if not text.isdigit() or not 1 <= int(text) <= MAX_KOLS:
+        raise ValueError(f'Send a whole number between 1 and {MAX_KOLS}, like <code>3</code>.')
     return int(text)
 
 
@@ -108,34 +108,33 @@ def _mult_value(text):
 
 
 def _usd_value(text):
-    text = text.lstrip('$').replace(',', '')
+    text = text.lstrip('$')
     factor = _SUFFIXES.get(text[-1:], 1)
     return float(text[:-1] if factor != 1 else text) * factor
 
 
 def parse_bounds(text, kind):
-    """'a-b', 'a b', 'a-' (a or more), '-b' (up to b), '<b', '>a' or 'any'. Returns (low, high)."""
+    """'min, max' with 'any' (or nothing) for an open side; 'any' alone clears both. Returns (low, high).
+
+    'a - b' and 'a to b' are accepted too.
+    """
     value = _mult_value if kind == 'mult' else _usd_value
     what = 'multiplier' if kind == 'mult' else 'market cap'
-    text = ' '.join(text.strip().lower().replace(' to ', '-').split())
+    examples = ('<code>0.7, 2</code> · <code>1, any</code> · <code>any, 3</code>' if kind == 'mult'
+                else '<code>20k, 100k</code> · <code>20k, any</code> · <code>any, 100k</code>')
+    text = ' '.join(text.strip().lower().replace(' to ', ',').split())
     try:
-        if text in ('any', 'all', 'none', '-', ''):
+        if text in ('any', 'all', 'none', ''):
             return None, None
-        if text[0] in '<>':
-            bound = value(text[1:].strip())
-            low, high = (None, bound) if text[0] == '<' else (bound, None)
-        elif '-' in text:
-            left, right = (part.strip() for part in text.split('-', 1))
-            low = None if left in ('', 'any') else value(left)
-            high = None if right in ('', 'any') else value(right)
-        else:
-            parts = text.split()
-            if len(parts) != 2:
-                raise ValueError
-            low, high = (None if p == 'any' else value(p) for p in parts)
+        separator = ',' if ',' in text else '-' if '-' in text else None
+        if separator is None:
+            raise ValueError
+        parts = [part.strip() for part in text.split(separator)]
+        if len(parts) != 2:
+            raise ValueError
+        low, high = (None if p in ('', 'any') else value(p) for p in parts)
     except (ValueError, IndexError):
-        raise ValueError(f'I could not read that {what} range. Examples: '
-                         + ('0.7-2 · 1- · -3 · any' if kind == 'mult' else '20k-100k · -100k · 20k- · any')) from None
+        raise ValueError(f'Send <code>min, max</code>, like {examples}') from None
     if any(b is not None and b <= 0 for b in (low, high)):
         raise ValueError(f'The {what} values must be greater than 0.')
     check_range(low, high, what)
@@ -160,37 +159,60 @@ def toggle_venue(user, key):
     return ','.join(k for k in VENUE_GROUPS if k in selected)
 
 
+def toggle_alert(user, key):
+    """Returns the new stored muted value ('a,b' or None when every alert is on)."""
+    if key == 'all':
+        return None
+    muted = _keys(user.get('muted')) ^ {key}
+    return ','.join(k for k in ALERT_TYPES if k in muted) or None
+
+
 # --- keyboards -----------------------------------------------------------------
-def settings_keyboard():
+def _button(text, data):
+    return {'text': text, 'callback_data': data}
+
+
+def panel_keyboard():
     return {'inline_keyboard': [
-        [{'text': '⏱ Change min time', 'callback_data': 'edit:time'}],
-        [{'text': '📈 Change multiplier range', 'callback_data': 'edit:mult'}],
-        [{'text': '💰 Change market cap range', 'callback_data': 'edit:mcap'}],
-        [{'text': '🏦 Change venues', 'callback_data': 'venues'}],
-        [{'text': '📋 Show my matches', 'callback_data': 'show'}],
+        [_button('⏱ Time', 'edit:time'), _button('👥 KOLs', 'edit:kols')],
+        [_button('📈 Multiplier', 'edit:mult'), _button('💰 Market cap', 'edit:mcap')],
+        [_button('🏦 Venues', 'venues'), _button('🔔 Alerts', 'alerts')],
+        [_button('📋 My matches', 'show')],
     ]}
+
+
+def _toggle_rows(options, is_on, prefix):
+    buttons = [_button(f'{"✅" if is_on(key) else "▫️"} {label}', f'{prefix}:{key}') for key, label in options]
+    return [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
 
 
 def venues_keyboard(user):
     selected = user_venues(user) or set(VENUE_GROUPS)
-    buttons = [{'text': f'{"✅" if key in selected else "▫️"} {label}', 'callback_data': f'venue:{key}'}
-               for key, (label, _) in VENUE_GROUPS.items()]
-    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    rows.append([{'text': '☑️ Select all', 'callback_data': 'venue:all'},
-                 {'text': '⬅️ Back', 'callback_data': 'settings'}])
+    rows = _toggle_rows(((k, label) for k, (label, _) in VENUE_GROUPS.items()), selected.__contains__, 'venue')
+    rows.append([_button('Select all', 'venue:all'), _button('⬅️ Back', 'settings')])
     return {'inline_keyboard': rows}
+
+
+def alerts_keyboard(user):
+    rows = _toggle_rows(ALERT_TYPES.items(), lambda key: alert_on(user, key), 'alert')
+    rows.append([_button('Turn all on', 'alert:all'), _button('⬅️ Back', 'settings')])
+    return {'inline_keyboard': rows}
+
+
+def cancel_keyboard():
+    return {'inline_keyboard': [[_button('✖️ Cancel', 'cancel')]]}
 
 
 def page_keyboard(page, pages):
     rows = []
     if pages > 1:
-        nav = [{'text': f'{page + 1} / {pages}', 'callback_data': 'noop'}]
+        nav = [_button(f'{page + 1} / {pages}', 'noop')]
         if page > 0:
-            nav.insert(0, {'text': '◀️ Prev', 'callback_data': f'page:{page - 1}'})
+            nav.insert(0, _button('◀️', f'page:{page - 1}'))
         if page < pages - 1:
-            nav.append({'text': 'Next ▶️', 'callback_data': f'page:{page + 1}'})
+            nav.append(_button('▶️', f'page:{page + 1}'))
         rows.append(nav)
-    rows.append([{'text': '🔄 Refresh', 'callback_data': f'page:{page}'}])
+    rows.append([_button('🔄 Refresh', f'page:{page}'), _button('⚙️ Filters', 'settings_new')])
     return {'inline_keyboard': rows}
 
 
@@ -203,7 +225,7 @@ class SpectralBot:
         self.interval = interval
         self.queue = asyncio.Queue()
         self.users = {row['chat_id']: dict(row) for row in store.spectral_users()}
-        self.followers = {}  # mint -> chats that were sent the token (they get its events)
+        self.followers = {}  # mint -> chats that were sent the token (they get its updates)
         self.seen = {}       # chat -> mints already sent or skipped
         self.pending = {}    # chat -> filter waiting for a typed value
         for row in store.spectral_deliveries():
@@ -248,30 +270,36 @@ class SpectralBot:
             if 'not modified' not in (exc.description or ''):
                 log.warning('Spectral edit failed: %s', exc)
 
+    async def _show_screen(self, chat_id, message_id, text, markup):
+        if message_id:
+            await self._edit(chat_id, message_id, text, markup)
+        else:
+            await self._send(chat_id, text, markup=markup)
+
     def deactivate(self, chat_id):
         self.store.spectral_deactivate(chat_id)
         if chat_id in self.users:
             self.users[chat_id]['active'] = 0
 
-    def listeners(self, mint):
-        """Users who received the token and for whom it still fits (in trending, ranges, venues)."""
-        state = self.tracker.trends.get(mint)
+    def listeners(self, mint, kind):
+        """Users who received the token, still fit it and have this update type on."""
+        state = self.tracker.tracked(mint)
         return [chat_id for chat_id in self.followers.get(mint, ())
-                if self.users.get(chat_id, {}).get('active')
+                if self.users.get(chat_id, {}).get('active') and alert_on(self.users[chat_id], kind)
                 and fits(self.users[chat_id], state, self.tracker.sol_usd)]
 
-    def forward(self, mint, text):
-        """Called by the tracker for every event message (not trending alerts, not buys)."""
-        for chat_id in self.listeners(mint):
+    def forward(self, mint, text, kind):
+        """Called by the tracker for every event message, with its ALERT_TYPES key."""
+        for chat_id in self.listeners(mint, kind):
             self.enqueue(chat_id, text, mint)
 
     def on_kol_buy(self, kol, wallet, trade, meta, paid):
         mint = trade['mint']
-        targets = self.listeners(mint)
+        targets = self.listeners(mint, 'buy')
         if not targets:
             return
         first_buy = sum(r['buy_count'] for r in self.store.kol_positions(kol.id, mint)) == 1
-        text = fmt.spectral_buy(kol, wallet, trade, meta, self.tracker.trends[mint],
+        text = fmt.spectral_buy(kol, wallet, trade, meta, self.tracker.tracked(mint),
                                 self.kols_in(mint), self.tracker.sol_usd, paid, first_buy)
         for chat_id in targets:
             self.enqueue(chat_id, text, mint)
@@ -288,7 +316,7 @@ class SpectralBot:
         """Skip what already matches so starting or changing filters doesn't cause a burst."""
         user = self.users[chat_id]
         seen = self.seen.setdefault(chat_id, set())
-        for state in list(self.tracker.trends.values()):
+        for state in self.tracker.candidates():
             if state.mint not in seen and matches(user, state, now, self.tracker.sol_usd):
                 self.store.spectral_record_delivery(chat_id, state.mint, now, sent=False)
                 seen.add(state.mint)
@@ -303,7 +331,7 @@ class SpectralBot:
             await asyncio.sleep(SPECTRAL_CHECK_SECONDS)
 
     async def deliver_due(self, now):
-        for state in list(self.tracker.trends.values()):
+        for state in self.tracker.candidates():
             targets = [chat_id for chat_id, user in self.users.items()
                        if user['active'] and state.mint not in self.seen.get(chat_id, ())
                        and matches(user, state, now, self.tracker.sol_usd)]
@@ -323,8 +351,7 @@ class SpectralBot:
         """One page of the user's current matches; edits message_id in place when given."""
         user = self.users[chat_id]
         now = now_ms()
-        found = sorted((s for s in list(self.tracker.trends.values())
-                        if matches(user, s, now, self.tracker.sol_usd)),
+        found = sorted((s for s in self.tracker.candidates() if matches(user, s, now, self.tracker.sol_usd)),
                        key=lambda s: s.entered_ts)
         pages = max(1, -(-len(found) // SPECTRAL_PAGE_SIZE))
         page = min(max(page, 0), pages - 1)
@@ -332,14 +359,9 @@ class SpectralBot:
         items = []
         for state in found[start:start + SPECTRAL_PAGE_SIZE]:
             self.follow(chat_id, state.mint, now)
-            kol_count = len({p['kol_id'] for p in self.store.token_positions(state.mint)})
-            items.append((await self.tracker.token_meta(state.mint), state, kol_count))
-        text = fmt.spectral_list(items, len(found), start, self.tracker.sol_usd, now)
-        markup = page_keyboard(page, pages)
-        if message_id:
-            await self._edit(chat_id, message_id, text, markup)
-        else:
-            await self._send(chat_id, text, markup=markup)
+            items.append((await self.tracker.token_meta(state.mint), state))
+        text = fmt.spectral_list(items, len(found), start, page, pages, self.tracker.sol_usd, now)
+        await self._show_screen(chat_id, message_id, text, page_keyboard(page, pages))
 
     # --- incoming -----------------------------------------------------------
     async def poll_updates(self):
@@ -393,56 +415,52 @@ class SpectralBot:
         self.pending.pop(chat_id, None)
         command, _, args = text.partition(' ')
         command = command.split('@')[0].lower()
-        if command == '/start':
-            if joined:
-                await self._send(chat_id, fmt.spectral_welcome())
-            await self.send_settings(chat_id)
-        elif command == '/settings':
-            await self.send_settings(chat_id)
+        user = self.users[chat_id]
+        typed = {'/time': 'time', '/kols': 'kols', '/range': 'mult', '/mcap': 'mcap'}
+        if command in ('/start', '/settings'):
+            await self.send_panel(chat_id, 'welcome' if joined else None)
         elif command == '/show':
             await self.show(chat_id)
         elif command == '/venues':
-            user = self.users[chat_id]
             await self._send(chat_id, fmt.spectral_venues(user), markup=venues_keyboard(user))
-        elif command in ('/time', '/range', '/mcap'):
-            field = {'/time': 'time', '/range': 'mult', '/mcap': 'mcap'}[command]
+        elif command == '/alerts':
+            await self._send(chat_id, fmt.spectral_alerts(user), markup=alerts_keyboard(user))
+        elif command in typed:
             if args.strip():
-                await self.apply(chat_id, field, args)
+                await self.apply(chat_id, typed[command], args)
             else:
-                await self.ask(chat_id, field)
+                await self.ask(chat_id, typed[command])
         else:
             await self._send(chat_id, fmt.spectral_help())
 
-    async def ask(self, chat_id, field):
+    async def ask(self, chat_id, field, message_id=None):
         self.pending[chat_id] = field
-        await self._send(chat_id, PROMPTS[field])
+        await self._show_screen(chat_id, message_id, fmt.spectral_prompt(field), cancel_keyboard())
 
     async def apply(self, chat_id, field, text):
         try:
             if field == 'time':
                 self.set_filters(chat_id, min_minutes=parse_minutes(text))
-            elif field == 'mult':
-                low, high = parse_bounds(text, 'mult')
-                self.set_filters(chat_id, min_mult=low, max_mult=high)
+            elif field == 'kols':
+                self.set_filters(chat_id, min_kols=parse_kols(text))
             else:
-                low, high = parse_bounds(text, 'mcap')
-                self.set_filters(chat_id, min_mcap=low, max_mcap=high)
+                low, high = parse_bounds(text, field)
+                self.set_filters(chat_id, **{f'min_{field}': low, f'max_{field}': high})
         except ValueError as exc:
-            await self._send(chat_id, f'⚠️ {exc}')
+            await self._send(chat_id, f'⚠️ {exc}', markup=cancel_keyboard())
             return
         self.pending.pop(chat_id, None)
-        await self.send_settings(chat_id, saved=True)
+        await self.send_panel(chat_id, 'saved')
 
-    async def send_settings(self, chat_id, saved=False):
-        await self._send(chat_id, fmt.spectral_settings(self.users[chat_id], saved),
-                         markup=settings_keyboard())
+    async def send_panel(self, chat_id, intro=None, message_id=None):
+        await self._show_screen(chat_id, message_id, fmt.spectral_panel(self.users[chat_id], intro),
+                                panel_keyboard())
 
     def set_filters(self, chat_id, **changes):
         user = dict(self.users[chat_id], **changes)
         check_range(user['min_mult'], user['max_mult'], 'multiplier')
         check_range(user['min_mcap'], user['max_mcap'], 'market cap')
-        self.store.spectral_update_filters(chat_id, user['min_minutes'], user['min_mult'], user['max_mult'],
-                                           user['min_mcap'], user['max_mcap'], user['venues'])
+        self.store.spectral_update_filters(chat_id, user)
         self.users[chat_id] = user
         self.mark_current_as_seen(chat_id, now_ms())
 
@@ -454,11 +472,13 @@ class SpectralBot:
         message_id = message.get('message_id')
         self.ensure_user(chat)
         notice = None
-        if data.startswith('venue:'):
-            try:
+        try:
+            if data.startswith('venue:'):
                 self.set_filters(chat_id, venues=toggle_venue(self.users[chat_id], data[6:]))
-            except ValueError as exc:
-                notice = str(exc)
+            elif data.startswith('alert:'):
+                self.set_filters(chat_id, muted=toggle_alert(self.users[chat_id], data[6:]))
+        except ValueError as exc:
+            notice = str(exc)
         await self.api.call('answerCallbackQuery', {'callback_query_id': query['id'],
                                                     'text': notice or '', 'show_alert': bool(notice)})
         user = self.users[chat_id]
@@ -466,13 +486,14 @@ class SpectralBot:
             await self.show(chat_id)
         elif data.startswith('page:'):
             await self.show(chat_id, int(data[5:]), message_id)
-        elif data.startswith('edit:') and data[5:] in PROMPTS:
-            await self.ask(chat_id, data[5:])
+        elif data.startswith('edit:') and data[5:] in TYPED_FIELDS:
+            await self.ask(chat_id, data[5:], message_id)
         elif data == 'venues' or data.startswith('venue:'):
-            text, markup = fmt.spectral_venues(user), venues_keyboard(user)
-            if message_id:
-                await self._edit(chat_id, message_id, text, markup)
-            else:
-                await self._send(chat_id, text, markup=markup)
-        elif data == 'settings' and message_id:
-            await self._edit(chat_id, message_id, fmt.spectral_settings(user), settings_keyboard())
+            await self._show_screen(chat_id, message_id, fmt.spectral_venues(user), venues_keyboard(user))
+        elif data == 'alerts' or data.startswith('alert:'):
+            await self._show_screen(chat_id, message_id, fmt.spectral_alerts(user), alerts_keyboard(user))
+        elif data in ('settings', 'cancel'):
+            self.pending.pop(chat_id, None)
+            await self.send_panel(chat_id, message_id=message_id)
+        elif data == 'settings_new':
+            await self.send_panel(chat_id)

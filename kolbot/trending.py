@@ -41,6 +41,7 @@ class TrendState:
     entry: float = None  # market cap when tracking started
     mcap: float = None   # latest market cap
     venue: str = None    # PumpAPI pool of the latest trade
+    kols: int = 0        # distinct KOLs that bought the token
 
     def __post_init__(self):
         if self.entry is None:
