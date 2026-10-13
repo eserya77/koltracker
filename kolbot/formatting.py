@@ -26,14 +26,14 @@ VENUES = {
 
 # Event type -> (emoji, name shown on the first line).
 EVENTS = {
-    'migrate': ('🎓', 'MIGRATION'),
-    'create': ('🧪', 'TOKEN CREATED'),
-    'add': ('💧', 'LIQUIDITY ADDED'),
-    'remove': ('🏜', 'LIQUIDITY REMOVED'),
-    'dex_paid': ('🦅', 'DEX PAID'),
-    'cto': ('🏴‍☠️', 'COMMUNITY TAKEOVER'),
-    'boost': ('⚡', 'DEX BOOST'),
-    'ad': ('📣', 'DEX AD'),
+    'migrate': ('🎓', 'Migration'),
+    'create': ('🧪', 'Token created'),
+    'add': ('💧', 'Liquidity added'),
+    'remove': ('🏜', 'Liquidity removed'),
+    'dex_paid': ('🦅', 'DEX paid'),
+    'cto': ('🏴‍☠️', 'Community takeover'),
+    'boost': ('⚡', 'DEX boost'),
+    'ad': ('📣', 'DEX ad'),
 }
 
 
@@ -146,7 +146,7 @@ def header(icon, meta, kol_text):
 
 def event_header(type_, meta, kol_text):
     icon, name = EVENTS[type_]
-    return section(f'{icon} <b>{name}</b>', token_line(meta), kol_line(kol_text))
+    return message(f'{icon} <b>{name}</b>', section(token_line(meta), kol_line(kol_text)))
 
 
 def ca(mint):
@@ -156,14 +156,14 @@ def ca(mint):
 def dex_paid_line(paid):
     if paid is None:
         return None
-    return '🦅 DEX Paid ✅' if paid else '🦅 DEX Paid ❌'
+    return '🦅 DEX paid: ✅' if paid else '🦅 DEX paid: ❌'
 
 
 def trade_block(trade, sol_usd):
     sol = salted(trade['sol'], trade['wallet'], trade['mint'])
-    return section(f'🛒 Bought <b>{fmt_sol(sol)}</b>',
-                   f'📊 MC {fmt_mcap(trade["mcap_sol"], sol_usd)}',
-                   f'🏦 {venue_name(trade["venue"])}')
+    return section(f'🛒 Bought: <b>{fmt_sol(sol)}</b>',
+                   f'📊 MC: {fmt_mcap(trade["mcap_sol"], sol_usd)}',
+                   f'🏦 Venue: {venue_name(trade["venue"])}')
 
 
 def group_block(title, rows, sol_usd, now):
@@ -229,7 +229,7 @@ def migration(mint, meta, event, mcap_sol, sol_usd, holders):
         event_header('migrate', meta, ', '.join(holders)),
         ca(mint),
         section(f'🏦 New pool: {venue_name(event.get("pool"))}',
-                f'📊 MC {fmt_mcap(mcap_sol, sol_usd)}',
+                f'📊 MC: {fmt_mcap(mcap_sol, sol_usd)}',
                 f'🔥 Burned liquidity: {escape(str(burned))}' if burned is not None else None),
     )
 
@@ -238,8 +238,8 @@ def kol_create(kol, wallet, mint, meta, event, sol_usd, mcap_sol):
     return message(
         event_header('create', meta, wallet_role(kol, wallet)),
         ca(mint),
-        section(f'🏦 {venue_name(event.get("pool"))}',
-                f'📊 MC {fmt_mcap(mcap_sol, sol_usd)}'),
+        section(f'🏦 Venue: {venue_name(event.get("pool"))}',
+                f'📊 MC: {fmt_mcap(mcap_sol, sol_usd)}'),
     )
 
 
@@ -247,16 +247,16 @@ def liquidity(kol, wallet, mint, meta, action, sol, tokens, event):
     return message(
         event_header(action, meta, wallet_role(kol, wallet)),
         ca(mint),
-        section(f'💰 {fmt_sol(salted(sol, wallet.address, mint))} + '
+        section(f'💰 Amount: {fmt_sol(salted(sol, wallet.address, mint))} + '
                 f'{fmt_num(salted(tokens or 0, wallet.address, mint))} tokens',
-                f'🏦 {venue_name(event.get("pool"))}'),
+                f'🏦 Venue: {venue_name(event.get("pool"))}'),
     )
 
 
 def dex_event(type_, mint, meta, item, holders):
     details = None
     if type_ == 'boost':
-        details = f'⚡ +{item.get("amount", "?")} (total {item.get("totalAmount", "?")})'
+        details = f'⚡ Boost: +{item.get("amount", "?")} (total {item.get("totalAmount", "?")})'
     elif type_ == 'ad':
-        details = f'📣 {escape(str(item.get("type") or "ad"))} · {item.get("durationHours", "?")}h'
+        details = f'📣 Ad: {escape(str(item.get("type") or "ad"))} · {item.get("durationHours", "?")}h'
     return message(event_header(type_, meta, ', '.join(holders)), ca(mint), details)

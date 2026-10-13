@@ -78,8 +78,8 @@ def test_end_to_end_flow():
         assert len(trend_posts) == 1 and '<b>2x</b>' in trend_posts[0]
         event_posts = [text for t, text in out.posts if t == TOPIC_EVENTS]
         assert len(event_posts) == 2
-        assert any(p.startswith('🎓 <b>MIGRATION</b>') and 'PumpSwap' in p for p in event_posts)
-        assert any(p.startswith('💧 <b>LIQUIDITY ADDED</b>') for p in event_posts)
+        assert any(p.startswith('🎓 <b>Migration</b>\n\n') and 'PumpSwap' in p for p in event_posts)
+        assert any(p.startswith('💧 <b>Liquidity added</b>\n\n') for p in event_posts)
 
         main_post = next(text for t, text in out.posts if t == TOPIC_MAINS)
         assert 'Alice · Main wallet' in main_post
